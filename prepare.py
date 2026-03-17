@@ -35,8 +35,19 @@ EXCHANGE_OVERRIDES = {
     # TAO/USDT — Binance (od 2024-04), ~11 mies. train + 1 rok val
 }
 
-# Barometry rynku (kontekst makro, Alpha Vantage)
-BAROMETER_ASSETS = ["SPY", "QQQ", "UUP"]
+# Barometry rynku — ETF intraday (Alpha Vantage)
+BAROMETER_ASSETS = ["SPY", "QQQ", "UUP", "GLD", "VIXY"]
+
+# Dane makroekonomiczne (Alpha Vantage, serie miesięczne/dzienne)
+MACRO_INDICATORS = {
+    "FED_RATE": {"function": "FEDERAL_FUNDS_RATE", "interval": "monthly"},
+    "CPI": {"function": "CPI", "interval": "monthly"},
+    "TREASURY_10Y": {"function": "TREASURY_YIELD", "maturity": "10year", "interval": "daily"},
+    "TREASURY_2Y": {"function": "TREASURY_YIELD", "maturity": "2year", "interval": "daily"},
+}
+
+# News sentiment (Alpha Vantage)
+SENTIMENT_TICKERS = ["COIN:BTC", "COIN:ETH"]
 
 INTERVAL_1H = "1h"
 CACHE_DIR = Path.home() / ".cache" / "autoquant" / "data"
@@ -238,6 +249,159 @@ def download_barometer(symbol: str, force: bool = False) -> pd.DataFrame:
     return df
 
 
+# ─── Pobieranie danych makroekonomicznych (Alpha Vantage) ────────
+
+def _fetch_av_macro(function: str, interval: str = "monthly",
+                    maturity: str = None) -> pd.DataFrame:
+    """
+    Pobiera dane makroekonomiczne z Alpha Vantage.
+    Zwraca DataFrame z kolumną 'value' i indeksem datetime.
+    """
+    if not AV_API_KEY:
+        raise RuntimeError("Brak klucza Alpha Vantage!")
+
+    params = {
+        "function": function,
+        "interval": interval,
+        "datatype": "json",
+        "apikey": AV_API_KEY,
+    }
+    if maturity:
+        params["maturity"] = maturity
+
+    print(f"    Pobieram {function} ({interval}) z Alpha Vantage...")
+    resp = requests.get(AV_BASE_URL, params=params, timeout=30)
+    data = resp.json()
+
+    # Szukamy klucza z danymi
+    data_key = None
+    for key in data:
+        if key == "data" or "data" in key.lower():
+            data_key = key
+            break
+
+    if not data_key or not data[data_key]:
+        raise RuntimeError(f"Brak danych AV dla {function}: {list(data.keys())}")
+
+    rows = []
+    for item in data[data_key]:
+        val = item.get("value", ".")
+        if val == "." or val is None:
+            continue
+        rows.append({
+            "timestamp": pd.Timestamp(item["date"]),
+            "value": float(val),
+        })
+
+    df = pd.DataFrame(rows)
+    df = df.set_index("timestamp")
+    df = df.sort_index()
+    return df
+
+
+def download_macro(name: str, config: dict, force: bool = False) -> pd.DataFrame:
+    """Pobiera wskaźnik makroekonomiczny, cache jako parquet."""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_path = CACHE_DIR / f"macro_{name}.parquet"
+
+    if cache_path.exists() and not force:
+        print(f"  {name}: wczytano z cache ({cache_path})")
+        return pd.read_parquet(cache_path)
+
+    print(f"  {name}: pobieram z Alpha Vantage...")
+    df = _fetch_av_macro(
+        function=config["function"],
+        interval=config.get("interval", "monthly"),
+        maturity=config.get("maturity"),
+    )
+
+    if df.empty:
+        raise RuntimeError(f"Brak danych makro dla {name}")
+
+    df.to_parquet(cache_path)
+    print(f"  {name}: zapisano {len(df)} punktów → {cache_path}")
+    return df
+
+
+# ─── Pobieranie sentymentu (Alpha Vantage) ──────────────────────
+
+def _fetch_av_sentiment(tickers: list[str]) -> pd.DataFrame:
+    """
+    Pobiera zagregowany sentyment newsów z Alpha Vantage.
+    Zwraca DataFrame z daily avg sentiment per ticker.
+    """
+    if not AV_API_KEY:
+        raise RuntimeError("Brak klucza Alpha Vantage!")
+
+    all_rows = []
+    for ticker in tickers:
+        print(f"    Pobieram sentyment dla {ticker}...")
+        params = {
+            "function": "NEWS_SENTIMENT",
+            "tickers": ticker,
+            "limit": 1000,
+            "sort": "LATEST",
+            "apikey": AV_API_KEY,
+        }
+        resp = requests.get(AV_BASE_URL, params=params, timeout=30)
+        data = resp.json()
+
+        feed = data.get("feed", [])
+        for article in feed:
+            pub_time = article.get("time_published", "")
+            if not pub_time:
+                continue
+
+            # Szukamy sentymentu dla naszego tickera
+            for ts in article.get("ticker_sentiment", []):
+                if ts.get("ticker") == ticker:
+                    all_rows.append({
+                        "timestamp": pd.Timestamp(pub_time[:8]),  # YYYYMMDD
+                        "ticker": ticker,
+                        "sentiment": float(ts.get("ticker_sentiment_score", 0)),
+                        "relevance": float(ts.get("relevance_score", 0)),
+                    })
+                    break
+
+        time.sleep(1.0)
+
+    if not all_rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(all_rows)
+    # Agreguj do daily — średni sentyment ważony relevance
+    df["weighted_sent"] = df["sentiment"] * df["relevance"]
+    daily = df.groupby(["timestamp", "ticker"]).agg(
+        sentiment=("weighted_sent", "sum"),
+        relevance=("relevance", "sum"),
+        count=("sentiment", "count"),
+    ).reset_index()
+    daily["sentiment"] = daily["sentiment"] / daily["relevance"].clip(lower=0.01)
+
+    return daily
+
+
+def download_sentiment(force: bool = False) -> pd.DataFrame:
+    """Pobiera sentyment newsów, cache jako parquet."""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_path = CACHE_DIR / "news_sentiment.parquet"
+
+    if cache_path.exists() and not force:
+        print(f"  Sentyment: wczytano z cache ({cache_path})")
+        return pd.read_parquet(cache_path)
+
+    print(f"  Sentyment: pobieram z Alpha Vantage...")
+    df = _fetch_av_sentiment(SENTIMENT_TICKERS)
+
+    if df.empty:
+        print(f"  ⚠ Sentyment: brak danych")
+        return df
+
+    df.to_parquet(cache_path)
+    print(f"  Sentyment: zapisano {len(df)} wpisów → {cache_path}")
+    return df
+
+
 # ─── Agregacja do 4H ────────────────────────────────────────────
 
 def resample_to_4h(df: pd.DataFrame) -> pd.DataFrame:
@@ -256,13 +420,17 @@ def resample_to_4h(df: pd.DataFrame) -> pd.DataFrame:
 
 def load_all_data(timeframe: str = "1h") -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
     """
-    Pobiera/wczytuje dane dla krypto + barometrów.
+    Pobiera/wczytuje dane dla krypto + barometrów + makro + sentyment.
 
     Args:
         timeframe: "1h" lub "4h"
 
     Returns:
         (crypto_data, barometer_data) — dwa słowniki DataFrames
+        barometer_data zawiera:
+          - ETF intraday: SPY, QQQ, UUP, GLD, VIXY
+          - Makro (resampled do daily): FED_RATE, CPI, TREASURY_10Y, TREASURY_2Y
+          - Sentyment: NEWS_BTC, NEWS_ETH (daily sentiment scores)
     """
     print(f"Ładowanie danych ({timeframe})...")
 
@@ -277,6 +445,8 @@ def load_all_data(timeframe: str = "1h") -> tuple[dict[str, pd.DataFrame], dict[
             print(f"  ⚠ {symbol}: błąd pobierania — {e}")
 
     barometer_data = {}
+
+    # ETF barometry (intraday)
     for symbol in BAROMETER_ASSETS:
         try:
             df = download_barometer(symbol)
@@ -286,7 +456,36 @@ def load_all_data(timeframe: str = "1h") -> tuple[dict[str, pd.DataFrame], dict[
         except Exception as e:
             print(f"  ⚠ {symbol}: błąd pobierania — {e}")
 
-    print(f"\nZaładowano: {len(crypto_data)} krypto, {len(barometer_data)} barometrów\n")
+    # Dane makroekonomiczne (monthly/daily → forward-fill do 4H/1H)
+    for name, config in MACRO_INDICATORS.items():
+        try:
+            df = download_macro(name, config)
+            # Zamień na OHLCV-like format (close = value) dla kompatybilności
+            macro_df = pd.DataFrame({"close": df["value"]})
+            barometer_data[name] = macro_df
+        except Exception as e:
+            print(f"  ⚠ {name}: błąd pobierania — {e}")
+
+    # News sentiment
+    try:
+        sent_df = download_sentiment()
+        if not sent_df.empty:
+            # Pivot na osobne kolumny per ticker
+            for ticker in SENTIMENT_TICKERS:
+                safe_name = f"NEWS_{ticker.replace('COIN:', '')}"
+                ticker_data = sent_df[sent_df["ticker"] == ticker].copy()
+                if not ticker_data.empty:
+                    ticker_data = ticker_data.set_index("timestamp")[["sentiment"]]
+                    ticker_data.columns = ["close"]  # kompatybilność
+                    barometer_data[safe_name] = ticker_data
+    except Exception as e:
+        print(f"  ⚠ Sentyment: błąd — {e}")
+
+    n_etf = sum(1 for k in barometer_data if k in BAROMETER_ASSETS)
+    n_macro = sum(1 for k in barometer_data if k in MACRO_INDICATORS)
+    n_sent = sum(1 for k in barometer_data if k.startswith("NEWS_"))
+    print(f"\nZaładowano: {len(crypto_data)} krypto, {n_etf} ETF, "
+          f"{n_macro} makro, {n_sent} sentyment\n")
     return crypto_data, barometer_data
 
 
@@ -560,12 +759,33 @@ if __name__ == "__main__":
     for symbol, df in crypto_data.items():
         train, val = split_periods(df)
         print(f"  {symbol}: {len(df)} świec 1h, {len(train)} train, {len(val)} val")
-        print(f"    Zakres: {df.index[0]} → {df.index[-1]}")
-        print(f"    Cena: {df['close'].iloc[0]:.2f} → {df['close'].iloc[-1]:.2f}")
+        if len(df) > 0:
+            print(f"    Zakres: {df.index[0]} → {df.index[-1]}")
+            print(f"    Cena: {df['close'].iloc[0]:.2f} → {df['close'].iloc[-1]:.2f}")
 
-    print("\n─── BAROMETRY (kontekst) ───")
-    for symbol, df in baro_data.items():
-        train, val = split_periods(df)
-        print(f"  {symbol}: {len(df)} świec 1h, {len(train)} train, {len(val)} val")
-        print(f"    Zakres: {df.index[0]} → {df.index[-1]}")
-        print(f"    Cena: {df['close'].iloc[0]:.2f} → {df['close'].iloc[-1]:.2f}")
+    print("\n─── ETF BAROMETRY ───")
+    for symbol in BAROMETER_ASSETS:
+        if symbol in baro_data:
+            df = baro_data[symbol]
+            train, val = split_periods(df)
+            print(f"  {symbol}: {len(df)} świec, {len(train)} train, {len(val)} val")
+            if len(df) > 0:
+                print(f"    Zakres: {df.index[0]} → {df.index[-1]}")
+
+    print("\n─── MAKRO ───")
+    for name in MACRO_INDICATORS:
+        if name in baro_data:
+            df = baro_data[name]
+            print(f"  {name}: {len(df)} punktów")
+            if len(df) > 0:
+                print(f"    Zakres: {df.index[0]} → {df.index[-1]}")
+                print(f"    Wartość: {df['close'].iloc[0]:.2f} → {df['close'].iloc[-1]:.2f}")
+
+    print("\n─── SENTYMENT ───")
+    for key in baro_data:
+        if key.startswith("NEWS_"):
+            df = baro_data[key]
+            print(f"  {key}: {len(df)} dni")
+            if len(df) > 0:
+                print(f"    Zakres: {df.index[0]} → {df.index[-1]}")
+                print(f"    Sentyment: {df['close'].mean():.4f} (średni)")
