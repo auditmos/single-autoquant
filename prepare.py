@@ -49,6 +49,10 @@ MACRO_INDICATORS = {
 # News sentiment (Alpha Vantage)
 SENTIMENT_TICKERS = ["COIN:BTC", "COIN:ETH"]
 
+# Funding rate + Open Interest (Binance Futures)
+# Tylko dla par dostępnych na Binance Futures
+FUTURES_ASSETS = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]  # XMR/TAO brak futures
+
 INTERVAL_1H = "1h"
 CACHE_DIR = Path.home() / ".cache" / "autoquant" / "data"
 
@@ -402,6 +406,76 @@ def download_sentiment(force: bool = False) -> pd.DataFrame:
     return df
 
 
+# ─── Funding Rate + Open Interest (Binance Futures) ─────────────
+
+def _fetch_funding_rate(symbol: str, since: str = "2020-01-01") -> pd.DataFrame:
+    """
+    Pobiera historię funding rate z Binance Futures.
+    Funding rate co 8h — kluczowy wskaźnik sentymentu rynku.
+    """
+    exchange = ccxt.binance({"options": {"defaultType": "future"}, "enableRateLimit": True})
+    since_ts = exchange.parse8601(f"{since}T00:00:00Z")
+
+    all_rates = []
+    print(f"    Pobieram funding rate {symbol}...")
+
+    while True:
+        try:
+            rates = exchange.fetch_funding_rate_history(symbol, since=since_ts, limit=1000)
+        except Exception as e:
+            if "ratelimit" in str(e).lower():
+                print(f"    ⏳ Rate limit, czekam 10s...")
+                time.sleep(10)
+                continue
+            raise
+
+        if not rates:
+            break
+
+        for r in rates:
+            all_rates.append({
+                "timestamp": pd.Timestamp(r["datetime"]),
+                "funding_rate": r["fundingRate"],
+            })
+
+        since_ts = rates[-1]["timestamp"] + 1
+
+        if len(rates) < 1000:
+            break
+
+        if len(all_rates) % 5000 < 1000:
+            print(f"    ... {len(all_rates)} rekordów")
+
+        time.sleep(0.3)
+
+    if not all_rates:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(all_rates)
+    df = df.set_index("timestamp")
+    df = df[~df.index.duplicated(keep="first")]
+    df = df.sort_index()
+    return df
+
+
+def download_funding_rate(symbol: str, force: bool = False) -> pd.DataFrame:
+    """Pobiera funding rate dla danego assetu, cache jako parquet."""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    safe_name = symbol.replace("/", "_")
+    fr_path = CACHE_DIR / f"{safe_name}_funding_rate.parquet"
+
+    if fr_path.exists() and not force:
+        print(f"  {symbol} FR: wczytano z cache")
+        return pd.read_parquet(fr_path)
+
+    fr_df = _fetch_funding_rate(symbol)
+    if not fr_df.empty:
+        fr_df.to_parquet(fr_path)
+        print(f"  {symbol} FR: zapisano {len(fr_df)} rekordów → {fr_path}")
+
+    return fr_df
+
+
 # ─── Agregacja do 4H ────────────────────────────────────────────
 
 def resample_to_4h(df: pd.DataFrame) -> pd.DataFrame:
@@ -466,6 +540,18 @@ def load_all_data(timeframe: str = "1h") -> tuple[dict[str, pd.DataFrame], dict[
         except Exception as e:
             print(f"  ⚠ {name}: błąd pobierania — {e}")
 
+    # Funding Rate (Binance Futures)
+    for symbol in FUTURES_ASSETS:
+        try:
+            fr_df = download_funding_rate(symbol)
+            safe = symbol.replace("/", "_").replace("USDT", "")
+
+            if not fr_df.empty:
+                fr_baro = pd.DataFrame({"close": fr_df["funding_rate"]})
+                barometer_data[f"FR_{safe}"] = fr_baro
+        except Exception as e:
+            print(f"  ⚠ Funding {symbol}: {e}")
+
     # News sentiment
     try:
         sent_df = download_sentiment()
@@ -483,9 +569,10 @@ def load_all_data(timeframe: str = "1h") -> tuple[dict[str, pd.DataFrame], dict[
 
     n_etf = sum(1 for k in barometer_data if k in BAROMETER_ASSETS)
     n_macro = sum(1 for k in barometer_data if k in MACRO_INDICATORS)
+    n_futures = sum(1 for k in barometer_data if k.startswith("FR_"))
     n_sent = sum(1 for k in barometer_data if k.startswith("NEWS_"))
     print(f"\nZaładowano: {len(crypto_data)} krypto, {n_etf} ETF, "
-          f"{n_macro} makro, {n_sent} sentyment\n")
+          f"{n_macro} makro, {n_futures} futures (FR+OI), {n_sent} sentyment\n")
     return crypto_data, barometer_data
 
 
@@ -780,6 +867,15 @@ if __name__ == "__main__":
             if len(df) > 0:
                 print(f"    Zakres: {df.index[0]} → {df.index[-1]}")
                 print(f"    Wartość: {df['close'].iloc[0]:.2f} → {df['close'].iloc[-1]:.2f}")
+
+    print("\n─── FUTURES (Funding Rate) ───")
+    for key in baro_data:
+        if key.startswith("FR_"):
+            df = baro_data[key]
+            print(f"  {key}: {len(df)} punktów")
+            if len(df) > 0:
+                print(f"    Zakres: {df.index[0]} → {df.index[-1]}")
+                print(f"    Wartość: {df['close'].iloc[-5:].values}")
 
     print("\n─── SENTYMENT ───")
     for key in baro_data:
