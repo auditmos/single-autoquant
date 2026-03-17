@@ -62,7 +62,32 @@ Composite: 35% Sharpe + 20% Sortino + 20% (1-drawdown) + 15% return + 10% win_ra
 Ważne: score musi być dobry na VALIDATION (2025-03 do 2026-03), nie tylko train.
 Unikaj overfittingu — duża różnica train vs val to zły znak.
 
-## Wskazówki
+## PRIORYTET: Sieci neuronowe PyTorch (GPU RTX 4090)
+
+Masz do dyspozycji RTX 4090 24GB — UŻYWAJ JEJ. Łącz wskaźniki techniczne z modelami neuronowymi.
+
+Architektura hybrydowa — najlepsze podejście:
+1. Wskaźniki (Ichimoku, RSI, MACD, ATR, volume) jako **features**
+2. Model neuronowy jako **decydent** — uczy się na train, generuje sygnały na val
+3. ATR trailing stop nadal chroni pozycje
+
+Przykładowe modele do wypróbowania:
+- **LSTM/GRU** — dobry na szeregi czasowe, lookback 20-50 świec
+- **1D CNN** — szybki, łapie lokalne wzorce cenowe
+- **Transformer** — attention na historię, dobry na dłuższe zależności
+- **Ensemble** — kilka małych modeli głosuje razem
+
+Wskazówki implementacji:
+- `import torch; device = torch.device("cuda")` — zawsze GPU
+- Features: close_pct, rsi, macd_hist, atr_norm, volume_ratio, cloud_dist, tenkan_kijun_diff, spy_trend, uup_trend
+- Normalizacja: StandardScaler na train, ten sam transform na val (unikaj data leakage!)
+- Train na TRAIN_START:TRAIN_END, predykcja na val
+- Output modelu: sygnał [-1, 1] (continuous), potem threshold na pozycje
+- Regularyzacja: dropout, weight decay, early stopping — KRYTYCZNE żeby nie overfitować
+- Małe modele (1-3 warstwy, 32-128 neuronów) — lepsze niż duże na tym zbiorze
+- Trenuj per-asset lub jeden model na wszystkie (z asset embedding)
+
+## Wskazówki ogólne
 
 - Małe zmiany, jeden parametr naraz — łatwiej ocenić co działa
 - XMR traci -89% na train — duży potencjał poprawy
@@ -70,3 +95,4 @@ Unikaj overfittingu — duża różnica train vs val to zły znak.
 - ETH i SOL działają dobrze — nie psuj tego co działa
 - ATR trailing stop bardzo pomógł — rozważ inne stopy (Chandelier, Parabolic SAR)
 - Proporcjonalne pozycje (0.5/1.0) pomagają — rozważ więcej gradacji
+- Jeśli model neuronowy daje gorszy score niż wskaźniki — spróbuj ensemble (model + wskaźniki razem)
