@@ -1,4 +1,4 @@
-# Program agenta — Autoquant
+# Program agenta — Autoquant (Faza 2)
 
 Jesteś autonomicznym agentem optymalizującym strategie tradingowe na krypto.
 
@@ -10,7 +10,7 @@ Po każdej modyfikacji uruchom `python3 strategy.py` i sprawdź wynik.
 ## Zasady
 
 1. Modyfikuj **wyłącznie** `strategy.py` — `prepare.py` jest read-only
-2. Nie dodawaj nowych zależności (pip install)
+2. Nie dodawaj nowych zależności (pip install). Dostępne: torch, pandas, numpy
 3. Każdy eksperyment musi się zakończyć w ~2 min
 4. Wyniki zapisują się automatycznie do `results.tsv`
 5. Zmień zmienną `OPIS` w strategy.py na krótki opis co zmieniłeś
@@ -26,26 +26,71 @@ Po każdej modyfikacji uruchom `python3 strategy.py` i sprawdź wynik.
 7. Jeśli score gorszy → cofnij zmiany (`git checkout strategy.py`), idź do kroku 2
 8. Powtarzaj w nieskończoność
 
-## Obecny baseline
+## Obecny baseline (po Fazie 1 — 43 eksperymenty)
 
-- Strategia: Ichimoku + RSI + MACD + ATR trailing stop + barometry makro
-- Score: ~0.06
+- Score: **0.4082**
+- Strategia: Dual MACD (12/26 + 8/17) + Ichimoku + EMA200 + ATR 1.9 trailing stop + cooldown 6 + profit target 3×ATR + chikou konfirmacja
 - Timeframe: 4H
 - Aktywa: BTC, ETH, XMR, SOL, TAO (long/short)
 - Barometry: SPY, QQQ, UUP (kontekst, nie handlowane)
 
-## Co możesz zmieniać w strategy.py
+### Per-asset wyniki (problem!):
+- **SOL: 0.975** — doskonały, nie psuj
+- **ETH: 0.642** — dobry, nie psuj
+- **XMR: 0.176** — słaby, -87% na train
+- **TAO: 0.154** — słaby, overfit
+- **BTC: 0.095** — BARDZO SŁABY, strategia nie łapie bull runów BTC
 
-- Parametry wskaźników (periody RSI, MACD, Ichimoku, ATR multiplier)
-- Dodawać wskaźniki: Bollinger Bands, Stochastic, OBV, VWAP, Williams %R
-- Regime detection (wykrywanie trendu vs range)
-- Ensemble voting (łączenie wielu sygnałów)
-- Sieci neuronowe PyTorch (GPU RTX 4090 dostępne)
-- Multi-timeframe (łączenie sygnałów z 1H i 4H)
-- Lepsze wejścia/wyjścia (breakout, pullback)
-- Optymalizacja ATR stop multiplier
-- Volume analysis
-- Korelacje między aktywami
+### Co zadziałało w Fazie 1:
+- EMA200 filter, ATR 1.9, Dual MACD, cooldown 6, profit target 3×ATR, chikou
+
+### Co NIE zadziałało w Fazie 1:
+- Stochastic, ADX, Bollinger, volume filter, crypto Ichimoku (7/22/44), long-only, ensemble voting, QQQ macro
+
+## FAZA 2 — PLAN ATAKU (wykonuj w tej kolejności!)
+
+### Krok 1: Per-asset parametry (szybki zysk)
+
+BTC ma score 0.095 — to OGROMNY potencjał. Strategia działa świetnie na SOL/ETH ale słabo na BTC.
+
+Rozwiązanie: **różne parametry per asset**. W `strategy()` sprawdzaj jaki to asset (po cenach — BTC > 10000, SOL < 500, itd. lub dodaj parametr) i stosuj inne:
+- BTC: może potrzebuje dłuższych MA, łagodniejszego ATR stop, innego MACD
+- XMR: specyficzny asset, Monero ma inną dynamikę (privacy coin)
+- TAO: AI token, bardzo młody, mała historia — może uproszczona strategia
+
+Nie psuj SOL i ETH! Testuj zmiany per-asset.
+
+### Krok 2: Sieci neuronowe PyTorch (GPU RTX 4090 24GB)
+
+Po wyczerpaniu per-asset tuningu, przejdź do modeli neuronowych.
+
+Architektura hybrydowa:
+1. Wskaźniki techniczne jako **features** (close_pct, rsi, macd_hist, atr_norm, volume_ratio, cloud_dist, tenkan_kijun_diff, spy_trend, uup_trend)
+2. **Mały model neuronowy** jako decydent — uczy się na train, generuje sygnały na val
+3. ATR trailing stop nadal chroni pozycje
+
+Modele do wypróbowania:
+- **LSTM/GRU** (lookback 20-50 świec) — klasyka dla time series
+- **1D CNN** — szybki, łapie lokalne wzorce
+- **Transformer** — attention, dobre na dłuższe zależności
+- **Ensemble** — kilka małych modeli głosuje
+
+Implementacja:
+```python
+import torch
+import torch.nn as nn
+device = torch.device("cuda")  # RTX 4090
+
+# Mały model — 1-3 warstwy, 32-128 neuronów
+# Regularyzacja: dropout=0.3, weight_decay=1e-4, early stopping
+# Normalizacja: StandardScaler fit na train, transform na val (BEZ data leakage!)
+# Output: sygnał [-1, 1] (continuous), threshold na pozycje
+# Trenuj PER-ASSET (każdy asset ma swój model)
+```
+
+### Krok 3: Multi-timeframe (jeśli zostanie czas)
+
+Łączenie sygnałów z 1H (precyzyjne wejścia) i 4H (kierunek trendu).
 
 ## Czego NIE zmieniać
 
@@ -61,38 +106,3 @@ Composite: 35% Sharpe + 20% Sortino + 20% (1-drawdown) + 15% return + 10% win_ra
 
 Ważne: score musi być dobry na VALIDATION (2025-03 do 2026-03), nie tylko train.
 Unikaj overfittingu — duża różnica train vs val to zły znak.
-
-## PRIORYTET: Sieci neuronowe PyTorch (GPU RTX 4090)
-
-Masz do dyspozycji RTX 4090 24GB — UŻYWAJ JEJ. Łącz wskaźniki techniczne z modelami neuronowymi.
-
-Architektura hybrydowa — najlepsze podejście:
-1. Wskaźniki (Ichimoku, RSI, MACD, ATR, volume) jako **features**
-2. Model neuronowy jako **decydent** — uczy się na train, generuje sygnały na val
-3. ATR trailing stop nadal chroni pozycje
-
-Przykładowe modele do wypróbowania:
-- **LSTM/GRU** — dobry na szeregi czasowe, lookback 20-50 świec
-- **1D CNN** — szybki, łapie lokalne wzorce cenowe
-- **Transformer** — attention na historię, dobry na dłuższe zależności
-- **Ensemble** — kilka małych modeli głosuje razem
-
-Wskazówki implementacji:
-- `import torch; device = torch.device("cuda")` — zawsze GPU
-- Features: close_pct, rsi, macd_hist, atr_norm, volume_ratio, cloud_dist, tenkan_kijun_diff, spy_trend, uup_trend
-- Normalizacja: StandardScaler na train, ten sam transform na val (unikaj data leakage!)
-- Train na TRAIN_START:TRAIN_END, predykcja na val
-- Output modelu: sygnał [-1, 1] (continuous), potem threshold na pozycje
-- Regularyzacja: dropout, weight decay, early stopping — KRYTYCZNE żeby nie overfitować
-- Małe modele (1-3 warstwy, 32-128 neuronów) — lepsze niż duże na tym zbiorze
-- Trenuj per-asset lub jeden model na wszystkie (z asset embedding)
-
-## Wskazówki ogólne
-
-- Małe zmiany, jeden parametr naraz — łatwiej ocenić co działa
-- XMR traci -89% na train — duży potencjał poprawy
-- BTC train jest lekko stratny — też do poprawy
-- ETH i SOL działają dobrze — nie psuj tego co działa
-- ATR trailing stop bardzo pomógł — rozważ inne stopy (Chandelier, Parabolic SAR)
-- Proporcjonalne pozycje (0.5/1.0) pomagają — rozważ więcej gradacji
-- Jeśli model neuronowy daje gorszy score niż wskaźniki — spróbuj ensemble (model + wskaźniki razem)
