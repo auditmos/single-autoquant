@@ -47,6 +47,8 @@ from strategy import strategy, atr, LOOKBACK
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
+MODEL_CACHE_DIR = Path.home() / ".cache" / "autoquant" / "models"
+
 # Kolory ANSI
 GREEN = "\033[92m"
 RED = "\033[91m"
@@ -253,38 +255,48 @@ def send_telegram(signals_data: list[dict]):
         return
 
     now = datetime.now().strftime("%H:%M")
-    lines = [f"🤖 *AUTOQUANT — {now}*\n"]
+    all_flat = all(abs(s["signal"]) <= 0.05 for s in signals_data)
 
-    for s in signals_data:
-        action, desc, _ = interpret_signal(s["signal"])
-        emoji = "🟢" if s["signal"] > 0.05 else "🔴" if s["signal"] < -0.05 else "⏳"
-        price = s["price"]
-
-        line = f"{emoji} *{s['symbol']}* — {action}\n"
-        line += f"   `Cena:` ${price:,.2f}"
-
-        if abs(s["signal"]) > 0.05 and s.get("atr", 0) > 0:
-            atr_val = s["atr"]
-            if s["signal"] > 0:
-                sl = price - 1.9 * atr_val
-                tp = price + 3.0 * atr_val
-            else:
-                sl = price + 1.9 * atr_val
-                tp = price - 3.0 * atr_val
-            line += f"\n   `SL:` ${sl:,.2f} ({(sl/price-1)*100:+.1f}%)"
-            line += f"\n   `TP:` ${tp:,.2f} ({(tp/price-1)*100:+.1f}%)"
-
-        lines.append(line)
-
-    avg = np.mean([s["signal"] for s in signals_data])
-    if avg > 0.1:
-        lines.append("\n📈 Sentyment: BULLISH")
-    elif avg < -0.1:
-        lines.append("\n📉 Sentyment: BEARISH")
+    if all_flat:
+        # Krótkie podsumowanie gdy same FLAT
+        prices = "  ".join(
+            f"{s['symbol']}: ${s['price']:,.0f} ({s['change_24h']:+.1f}%)"
+            for s in signals_data
+        )
+        text = f"⏳ *AUTOQUANT {now}* — wszystkie FLAT\n`{prices}`"
     else:
-        lines.append("\n➡️ Sentyment: NEUTRALNY")
+        lines = [f"🤖 *AUTOQUANT — {now}*\n"]
 
-    text = "\n".join(lines)
+        for s in signals_data:
+            action, desc, _ = interpret_signal(s["signal"])
+            emoji = "🟢" if s["signal"] > 0.05 else "🔴" if s["signal"] < -0.05 else "⏳"
+            price = s["price"]
+
+            line = f"{emoji} *{s['symbol']}* — {action}\n"
+            line += f"   `Cena:` ${price:,.2f}"
+
+            if abs(s["signal"]) > 0.05 and s.get("atr", 0) > 0:
+                atr_val = s["atr"]
+                if s["signal"] > 0:
+                    sl = price - 1.9 * atr_val
+                    tp = price + 3.0 * atr_val
+                else:
+                    sl = price + 1.9 * atr_val
+                    tp = price - 3.0 * atr_val
+                line += f"\n   `SL:` ${sl:,.2f} ({(sl/price-1)*100:+.1f}%)"
+                line += f"\n   `TP:` ${tp:,.2f} ({(tp/price-1)*100:+.1f}%)"
+
+            lines.append(line)
+
+        avg = np.mean([s["signal"] for s in signals_data])
+        if avg > 0.1:
+            lines.append("\n📈 Sentyment: BULLISH")
+        elif avg < -0.1:
+            lines.append("\n📉 Sentyment: BEARISH")
+        else:
+            lines.append("\n➡️ Sentyment: NEUTRALNY")
+
+        text = "\n".join(lines)
 
     try:
         req.post(
@@ -327,8 +339,8 @@ def generate_signals(send_tg: bool = False) -> list[dict]:
             for baro_name, baro_df in barometers.items():
                 context[baro_name] = baro_df
 
-            # Uruchom strategię
-            signals = strategy(df, context)
+            # Uruchom strategię (z cache modeli — retrenuje max raz na 23h)
+            signals = strategy(df, context, model_cache_dir=MODEL_CACHE_DIR)
 
             # Ostatni sygnał = aktualny
             last_signal = signals.iloc[-1]

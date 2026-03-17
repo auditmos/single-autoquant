@@ -9,16 +9,24 @@ import pandas as pd
 import numpy as np
 import torch
 import torch.nn as nn
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 pd.set_option('future.no_silent_downcasting', True)
 from prepare import evaluate, plot_equity
 
 RESULTS_FILE = Path(__file__).parent / "results.tsv"
-OPIS = "LSTM_lb168_all_assets_1H"
+OPIS = "LSTM_lb168_per_asset_ensemble_1H"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 LOOKBACK = 168  # 168 świec lookback (1 tydzień na 1H)
 GLOBAL_SEED = 42  # zmieniane przy testach robustności
+
+# Per-asset ensemble: liczba modeli na asset (więcej = stabilniej, ale wolniej)
+# Bazowane na teście robustności 17.03: XMR std=0.98 (niestabilny), reszta std<0.28
+ENSEMBLE_SEEDS_STABLE = [42, 271]           # 2 modele dla stabilnych (BTC, TAO)
+ENSEMBLE_SEEDS_MODERATE = [42, 271, 404]    # 3 modele dla umiarkowanych (ETH, SOL)
+ENSEMBLE_SEEDS_UNSTABLE = [42, 271, 404, 999, 137]  # 5 modeli dla XMR
+
+MODEL_RETRAIN_HOURS = 23  # retrenuj model jeśli starszy niż 23h
 
 
 # ─── Wskaźniki ───────────────────────────────────────────────────
@@ -439,7 +447,67 @@ def btc_simple_strategy(df, context):
     return signals
 
 
-def strategy(df, context):
+# ─── Cache modeli ────────────────────────────────────────────────
+
+def _asset_id(df) -> str:
+    """Identyfikuje asset po cenie i zmienności."""
+    median_price = df["close"].median()
+    vol = df["close"].pct_change().std()
+    if median_price > 10000:
+        return "btc"
+    elif median_price < 1000 and vol < 0.016:
+        return "xmr"
+    elif median_price > 1000:
+        return "eth"
+    elif len(df) < 12000:
+        return "tao"
+    return "sol"
+
+
+def save_model(model_info, path: Path):
+    """Zapisuje model LSTM do pliku .pt"""
+    if model_info is None:
+        return
+    model, valid_idx, lookback = model_info
+    torch.save({
+        "state_dict": model.state_dict(),
+        "n_features": model.input_bn.num_features,
+        "hidden": model.lstm.hidden_size,
+        "n_layers": model.lstm.num_layers,
+        "dropout": model.lstm.dropout,
+        "lookback": lookback,
+        "valid_idx": valid_idx,
+    }, path)
+
+
+def load_model(path: Path):
+    """Ładuje model LSTM z pliku .pt — zwraca model_info lub None przy błędzie."""
+    if not path.exists():
+        return None
+    try:
+        data = torch.load(path, map_location=DEVICE, weights_only=False)
+        model = SignalLSTM(
+            n_features=data["n_features"],
+            hidden=data["hidden"],
+            n_layers=data["n_layers"],
+            dropout=data.get("dropout", 0.3),
+        ).to(DEVICE)
+        model.load_state_dict(data["state_dict"])
+        model.eval()
+        return model, data["valid_idx"], data["lookback"]
+    except Exception:
+        return None
+
+
+def _model_fresh(path: Path) -> bool:
+    """Sprawdza czy model jest świeższy niż MODEL_RETRAIN_HOURS."""
+    if not path.exists():
+        return False
+    age_hours = (datetime.now().timestamp() - path.stat().st_mtime) / 3600
+    return age_hours < MODEL_RETRAIN_HOURS
+
+
+def strategy(df, context, model_cache_dir=None):
     """
     Hybrid per-asset: BTC=simple trend, reszta=rule-based × LSTM confidence scaler.
     LSTM z lookback 50 świec przetwarza sekwencję wskaźników technicznych.
@@ -451,14 +519,47 @@ def strategy(df, context):
     vol = close.pct_change().std()
     is_xmr = median_price < 1000 and vol < 0.016
 
-    # ─── Wszystkie assety: czyste sygnały LSTM ───
+    # ─── Per-asset ensemble: dobierz liczbę modeli do stabilności assetu ───
+    if is_xmr:
+        seeds = ENSEMBLE_SEEDS_UNSTABLE   # 5 modeli — XMR bardzo niestabilny
+    elif is_btc:
+        seeds = ENSEMBLE_SEEDS_STABLE     # 2 modele — BTC stabilny
+    elif median_price > 1000:
+        seeds = ENSEMBLE_SEEDS_MODERATE   # 3 modele — ETH
+    else:
+        # SOL i TAO
+        n_rows = len(df)
+        if n_rows < 12000:  # TAO ma mniej danych (~8000 1H)
+            seeds = ENSEMBLE_SEEDS_STABLE     # 2 modele — TAO stabilny
+        else:
+            seeds = ENSEMBLE_SEEDS_MODERATE   # 3 modele — SOL
+
     features = build_features(df, context)
     fwd_ret = close.pct_change(48).shift(-48)
-
     te = int(len(df) * 0.8)
-    model_info = train_lstm(features.iloc[:te], fwd_ret.iloc[:te],
-                            lookback=LOOKBACK, n_epochs=300, lr=0.002, seed=GLOBAL_SEED)
-    nn_pred = predict_lstm_confidence(model_info, features)
+
+    # Opcjonalny cache modeli (używany przez live_signals.py)
+    cache_dir = Path(model_cache_dir) if model_cache_dir else None
+    if cache_dir:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    asset = _asset_id(df)
+
+    # Trenuj N modeli z różnymi seedami, uśrednij predykcje
+    preds = []
+    for seed in seeds:
+        model_info = None
+        if cache_dir:
+            cache_path = cache_dir / f"lstm_{asset}_s{seed}.pt"
+            if _model_fresh(cache_path):
+                model_info = load_model(cache_path)
+        if model_info is None:
+            model_info = train_lstm(features.iloc[:te], fwd_ret.iloc[:te],
+                                    lookback=LOOKBACK, n_epochs=300, lr=0.002, seed=seed)
+            if cache_dir:
+                save_model(model_info, cache_path)
+        pred = predict_lstm_confidence(model_info, features)
+        preds.append(pred)
+    nn_pred = sum(preds) / len(preds)
 
     # Czyste sygnały LSTM → pozycje
     signals = pd.Series(0.0, index=df.index)
