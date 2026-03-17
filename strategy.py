@@ -11,7 +11,7 @@ pd.set_option('future.no_silent_downcasting', True)
 from prepare import evaluate, plot_equity
 
 RESULTS_FILE = Path(__file__).parent / "results.tsv"
-OPIS = "Ichimoku+RSI+MACD+ATR_stop 4H proporcjonalne"
+OPIS = "dualMACD+ATR1.9+cd6+PT3+chikou"
 
 
 # ─── Wskaźniki ───────────────────────────────────────────────────
@@ -56,6 +56,33 @@ def macd(series: pd.Series, fast: int = 12, slow: int = 26,
     return {"macd": macd_line, "signal": signal_line, "hist": histogram}
 
 
+def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """ADX — Average Directional Index (trend strength)."""
+    high, low, close = df["high"], df["low"], df["close"]
+    prev_high = high.shift(1)
+    prev_low = low.shift(1)
+    prev_close = close.shift(1)
+
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+
+    plus_dm = ((high - prev_high).where((high - prev_high) > (prev_low - low), 0.0)
+               .where((high - prev_high) > 0, 0.0))
+    minus_dm = ((prev_low - low).where((prev_low - low) > (high - prev_high), 0.0)
+                .where((prev_low - low) > 0, 0.0))
+
+    atr_smooth = tr.ewm(span=period, min_periods=period).mean()
+    plus_di = 100 * plus_dm.ewm(span=period, min_periods=period).mean() / atr_smooth.replace(0, 1e-9)
+    minus_di = 100 * minus_dm.ewm(span=period, min_periods=period).mean() / atr_smooth.replace(0, 1e-9)
+
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, 1e-9)
+    adx_val = dx.ewm(span=period, min_periods=period).mean()
+    return adx_val
+
+
 def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     """ATR — Average True Range (zmienność)."""
     high, low, close = df["high"], df["low"], df["close"]
@@ -69,16 +96,19 @@ def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
 
 
 def atr_trailing_stop(close: pd.Series, atr_values: pd.Series,
-                      positions: pd.Series, multiplier: float = 2.0) -> pd.Series:
+                      positions: pd.Series, multiplier: float = 2.0,
+                      cooldown: int = 0, profit_target_atr: float = 0) -> pd.Series:
     """
-    ATR trailing stop — zamyka pozycję gdy cena spadnie o multiplier×ATR
-    od szczytu (long) lub wzrośnie od dołka (short).
-
-    Zwraca zmodyfikowane pozycje z wyzerowanymi stopami.
+    ATR trailing stop z cooldown i profit target.
+    Po zamknięciu czeka cooldown barów przed ponownym wejściem.
+    Profit target: gdy zysk > profit_target_atr × ATR, redukuj pozycję o połowę.
     """
     result = positions.copy()
     trail_price = np.nan
+    entry_price = np.nan
     direction = 0  # 1=long, -1=short
+    cooldown_remaining = 0
+    profit_taken = False
 
     for i in range(len(close)):
         pos = result.iloc[i]
@@ -88,37 +118,56 @@ def atr_trailing_stop(close: pd.Series, atr_values: pd.Series,
         if np.isnan(atr_val):
             continue
 
+        # Cooldown — wymuś flat
+        if cooldown_remaining > 0:
+            result.iloc[i] = 0
+            cooldown_remaining -= 1
+            direction = 0
+            continue
+
         stop_dist = multiplier * atr_val
 
         if pos > 0:  # Long
             if direction != 1:
-                # Nowy long — ustaw trailing stop
                 trail_price = price - stop_dist
+                entry_price = price
                 direction = 1
+                profit_taken = False
             else:
-                # Aktualizuj trailing stop w górę
                 new_trail = price - stop_dist
                 trail_price = max(trail_price, new_trail)
 
-                # Sprawdź czy cena spadła poniżej trailing stop
+                # Profit target: redukuj pozycję
+                if profit_target_atr > 0 and not profit_taken:
+                    if price > entry_price + profit_target_atr * atr_val:
+                        result.iloc[i] = pos * 0.5
+                        profit_taken = True
+
                 if price < trail_price:
                     result.iloc[i] = 0
                     direction = 0
+                    cooldown_remaining = cooldown
 
         elif pos < 0:  # Short
             if direction != -1:
-                # Nowy short — ustaw trailing stop
                 trail_price = price + stop_dist
+                entry_price = price
                 direction = -1
+                profit_taken = False
             else:
-                # Aktualizuj trailing stop w dół
                 new_trail = price + stop_dist
                 trail_price = min(trail_price, new_trail)
 
-                # Sprawdź czy cena wzrosła powyżej trailing stop
+                # Profit target for short
+                if profit_target_atr > 0 and not profit_taken:
+                    if price < entry_price - profit_target_atr * atr_val:
+                        result.iloc[i] = pos * 0.5
+                        profit_taken = True
+
                 if price > trail_price:
                     result.iloc[i] = 0
                     direction = 0
+                    cooldown_remaining = cooldown
 
         else:  # Flat
             direction = 0
@@ -151,6 +200,11 @@ def strategy(df: pd.DataFrame, context: dict[str, pd.DataFrame]) -> pd.Series:
     """
     close = df["close"]
 
+    # ─── EMA 200 filtr trendu ───
+    ema200 = close.ewm(span=200, min_periods=200).mean()
+    trend_up = close > ema200
+    trend_down = close < ema200
+
     # ─── Ichimoku ───
     ichi = ichimoku(df)
     tenkan = ichi["tenkan"]
@@ -161,14 +215,29 @@ def strategy(df: pd.DataFrame, context: dict[str, pd.DataFrame]) -> pd.Series:
     cloud_top = pd.concat([span_a, span_b], axis=1).max(axis=1)
     cloud_bottom = pd.concat([span_a, span_b], axis=1).min(axis=1)
 
+    # Chikou span: close shifted back 26 periods — confirms trend momentum
+    chikou = close.shift(-26)  # future-looking in display, but for signal we compare current close to close 26 periods ago
+    chikou_bull = close > close.shift(26)  # current price > price 26 bars ago
+    chikou_bear = close < close.shift(26)
+
     # ─── RSI ───
     rsi_val = rsi(close, period=14)
 
     # ─── MACD ───
+    # Standard MACD
     macd_data = macd(close)
     macd_hist = macd_data["hist"]
     macd_bullish = macd_hist > 0
     macd_bearish = macd_hist < 0
+
+    # Fast MACD
+    macd_fast = macd(close, fast=8, slow=17, signal=9)
+    macd_fast_bull = macd_fast["hist"] > 0
+    macd_fast_bear = macd_fast["hist"] < 0
+
+    # Dual MACD: both agree = strong signal
+    dual_bull = macd_bullish & macd_fast_bull
+    dual_bear = macd_bearish & macd_fast_bear
 
     # ─── ATR ───
     atr_val = atr(df, period=14)
@@ -194,30 +263,37 @@ def strategy(df: pd.DataFrame, context: dict[str, pd.DataFrame]) -> pd.Series:
     # ─── Sygnały z siłą ───
     signals = pd.Series(0.0, index=df.index)
 
-    # Warunek bazowy long: cena nad chmurą + tenkan > kijun + RSI > 45
+    # Long base: cena nad chmurą + tenkan > kijun + EMA200 up
     long_base = (
         (close > cloud_top)
         & (tenkan > kijun)
-        & (rsi_val > 45)
+        & trend_up
     )
 
-    # Long pełny (1.0): MACD potwierdza momentum
-    signals[long_base & macd_bullish] = 1.0
-    # Long częściowy (0.5): Ichimoku+RSI OK, ale MACD nie potwierdza
-    signals[long_base & ~macd_bullish] = 0.5
+    # Long pełny (1.0): oba MACD + chikou potwierdzają
+    signals[long_base & dual_bull & chikou_bull] = 1.0
+    # Long mocny (0.75): oba MACD ale bez chikou, LUB chikou + jeden MACD
+    signals[long_base & dual_bull & ~chikou_bull] = 0.75
+    signals[long_base & (macd_bullish | macd_fast_bull) & ~dual_bull & chikou_bull] = 0.75
+    # Long umiarkowany (0.5): jeden MACD bez chikou
+    signals[long_base & (macd_bullish | macd_fast_bull) & ~dual_bull & ~chikou_bull] = 0.5
+    # Long częściowy (0.5): żaden MACD nie potwierdza
+    signals[long_base & ~macd_bullish & ~macd_fast_bull] = 0.5
 
-    # Short (ostrożny): wymaga makro bearish + MACD bearish
+    # Short: wymaga makro bearish + oba MACD bearish + trend down
     short_cond = (
         (close < cloud_bottom)
         & (tenkan < kijun)
         & (rsi_val < 40)
         & macro_bearish
-        & macd_bearish
+        & dual_bear
+        & trend_down
     )
     signals[short_cond] = -1.0
 
     # ─── ATR trailing stop ───
-    signals = atr_trailing_stop(close, atr_val, signals, multiplier=2.0)
+    # ─── ATR trailing stop ───
+    signals = atr_trailing_stop(close, atr_val, signals, multiplier=1.9, cooldown=6, profit_target_atr=3.0)
 
     return signals
 
