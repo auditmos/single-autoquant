@@ -31,7 +31,7 @@ CRYPTO_ASSETS = ["BTC/USDT", "ETH/USDT", "XMR/USDT", "SOL/USDT", "TAO/USDT"]
 
 # Giełdy per asset (domyślnie Binance, tu wyjątki)
 EXCHANGE_OVERRIDES = {
-    "XMR/USDT": "bitfinex",  # Binance zdelisował XMR, Bitfinex ma pełną historię
+    "XMR/USDT": "kucoin",  # Binance zdelisował XMR; KuCoin ma największy vol XMR/USDT
     # TAO/USDT — Binance (od 2024-04), ~11 mies. train + 1 rok val
 }
 
