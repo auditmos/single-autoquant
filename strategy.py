@@ -27,6 +27,14 @@ BEST_MODEL_DIR = Path.home() / ".cache" / "autoquant" / "best_model"
 _SESSION_MODELS: dict = {}  # asset_id -> [(model_info, seed), ...]
 
 
+def _strip_tz(series):
+    """Usuwa timezone z indeksu Series (niektóre źródła np. ccxt/Binance mają UTC, OHLCV nie ma TZ)."""
+    if series.index.tz is not None:
+        series = series.copy()
+        series.index = series.index.tz_localize(None)
+    return series
+
+
 # ─── Wskaźniki ───────────────────────────────────────────────────
 
 def ichimoku(df, tenkan=9, kijun=26, senkou_b=52):
@@ -224,23 +232,16 @@ def build_features(df, context):
 
     spy_d = uup_d = pd.Series(0.0, index=df.index)
     if "SPY" in context and len(context["SPY"]) > 50:
-        s = context["SPY"]["close"]; sm = s.rolling(50).mean()
+        s = _strip_tz(context["SPY"]["close"]); sm = s.rolling(50).mean()
         spy_d = ((s-sm)/sm).reindex(df.index, method="ffill").fillna(0)
     if "UUP" in context and len(context["UUP"]) > 20:
-        u = context["UUP"]["close"]; um = u.rolling(20).mean()
+        u = _strip_tz(context["UUP"]["close"]); um = u.rolling(20).mean()
         uup_d = ((u-um)/um).reindex(df.index, method="ffill").fillna(0)
     features["spy_trend"] = spy_d.clip(-0.1,0.1)
     features["uup_trend"] = uup_d.clip(-0.05,0.05)
 
     # Funding rate rynku krypto (Binance Futures, co 8H → forward-fill na 1H)
     # Wysoki funding (>0.01%) = rynek przegrzany, longs przepłacają → ryzyko reversal
-    def _strip_tz(series):
-        """Usuwa timezone z indeksu Series (funding rate ma UTC, OHLCV nie ma TZ)."""
-        if series.index.tz is not None:
-            series = series.copy()
-            series.index = series.index.tz_localize(None)
-        return series
-
     fr_btc = fr_eth = fr_sol = pd.Series(0.0, index=df.index)
     if "FR_BTC_" in context and len(context["FR_BTC_"]) > 10:
         fr_btc = _strip_tz(context["FR_BTC_"]["close"]).reindex(df.index, method="ffill").fillna(0)
@@ -255,7 +256,7 @@ def build_features(df, context):
     # VIXY (ETF proxy VIX) — rośnie przy risk-off, spada przy risk-on
     vixy_d = pd.Series(0.0, index=df.index)
     if "VIXY" in context and len(context["VIXY"]) > 20:
-        vixy = context["VIXY"]["close"]
+        vixy = _strip_tz(context["VIXY"]["close"])
         vixy_ma = vixy.rolling(20).mean()
         vixy_d = ((vixy - vixy_ma) / vixy_ma.replace(0, 1e-9)).reindex(
             df.index, method="ffill").fillna(0)
@@ -586,10 +587,10 @@ def rule_based_signals(df, context):
     spy_bearish = pd.Series(False, index=df.index)
     dxy_rising = pd.Series(False, index=df.index)
     if "SPY" in context and len(context["SPY"]) > 200:
-        spy = context["SPY"]["close"]
+        spy = _strip_tz(context["SPY"]["close"])
         spy_bearish = (~(spy.rolling(50).mean() > spy.rolling(200).mean())).reindex(df.index, method="ffill").fillna(False)
     if "UUP" in context and len(context["UUP"]) > 50:
-        uup = context["UUP"]["close"]
+        uup = _strip_tz(context["UUP"]["close"])
         dxy_rising = (uup.rolling(20).mean() > uup.rolling(50).mean()).reindex(df.index, method="ffill").fillna(False)
     macro_bearish = spy_bearish | dxy_rising
 
@@ -626,10 +627,10 @@ def btc_simple_strategy(df, context):
     spy_bearish = pd.Series(False, index=df.index)
     dxy_rising = pd.Series(False, index=df.index)
     if "SPY" in context and len(context["SPY"]) > 200:
-        spy = context["SPY"]["close"]
+        spy = _strip_tz(context["SPY"]["close"])
         spy_bearish = (~(spy.rolling(50).mean() > spy.rolling(200).mean())).reindex(df.index, method="ffill").fillna(False)
     if "UUP" in context and len(context["UUP"]) > 50:
-        uup = context["UUP"]["close"]
+        uup = _strip_tz(context["UUP"]["close"])
         dxy_rising = (uup.rolling(20).mean() > uup.rolling(50).mean()).reindex(df.index, method="ffill").fillna(False)
     macro_bearish = spy_bearish | dxy_rising
 
@@ -650,23 +651,25 @@ def btc_simple_strategy(df, context):
 
 def _asset_id(df) -> str:
     """Identyfikuje asset po cenie mediany i zmienności.
-    Progi dobrane empirycznie na danych 2023-2026 (wszystkie okresy: full/train/val):
-      BTC  median > 10 000
-      ETH  median > 1 000
-      XMR  vol < 0.011 AND median > 155  (train=162, val=324 — zawsze > 155)
-      TAO  median > 150  (val=248, train=~300 — zawsze > SOL)
-      SOL  reszta  (val median=148, train=40 — zawsze < 150)
-    Uwaga: SOL w val period ma vol=0.0088 (niższy niż XMR!), dlatego sam vol nie wystarczy.
+    Progi zaktualizowane dla odporności na wzrost cen:
+      BTC  median > 5000  (był 10 000; bezpieczny margines — BTC zawsze powyżej)
+      ETH  median > 500 AND vol < 0.007  (dodano kryterium vol — ETH mniej zmienny
+           niż SOL/TAO nawet przy wysokich cenach; SOL/TAO 1H vol > 0.007)
+      XMR  vol < 0.011 AND median > 100  (niska zmienność; próg ceny obniżony z 155)
+      TAO  median > 200  (był 150; margines nad SOL val=148)
+      SOL  reszta
+    Rationale: SOL może przekroczyć $1000 → stare progi oparte wyłącznie na cenie
+    myliłyby go z ETH. Kryterium vol dla ETH rozwiązuje ten problem.
     """
     median_price = df["close"].median()
     vol = df["close"].pct_change().std()
-    if median_price > 10000:
+    if median_price > 5000:
         return "btc"
-    elif median_price > 1000:
+    elif median_price > 500 and vol < 0.007:
         return "eth"
-    elif vol < 0.011 and median_price > 155:
+    elif vol < 0.011 and median_price > 100:
         return "xmr"
-    elif median_price > 150:
+    elif median_price > 200:
         return "tao"
     return "sol"
 
@@ -728,16 +731,23 @@ def save_best_models(model_dir: Path = BEST_MODEL_DIR):
 def strategy(df, context, model_cache_dir=None, model_retrain_hours=MODEL_RETRAIN_HOURS):
     """
     LSTM 3L h=384 + BatchNorm + dropout=0.3, target=24h forward return.
-    Jeśli model_cache_dir podany i model jest świeży → ładuje z dysku (tryb live).
-    W przeciwnym razie trenuje od zera i zapisuje do cache (tryb backtest).
+
+    Tryby działania:
+    1. Live (model_cache_dir + świeży plik .pt) → ładuje model z dysku
+    2. Val/backtest — evaluate() wywołuje strategy() osobno dla train i val.
+       Gdy train był już przetworzony, model jest w _SESSION_MODELS.
+       Val używa tego modelu zamiast trenować od nowa na danych val
+       (poprzednie zachowanie = in-sample bias na zbiorze walidacyjnym).
+    3. Train — brak cache i brak modelu sesji → trening od zera, zapis do _SESSION_MODELS.
     """
     close = df["close"]
     features = build_features(df, context)
     n = len(df)
     asset = _asset_id(df)
     live_mode = False
+    session_mode = False
 
-    # ─── Próba załadowania z cache ───
+    # ─── Próba załadowania z cache (tryb live) ───
     model_info = None
     if model_cache_dir is not None:
         model_path = Path(model_cache_dir) / f"lstm_{asset}_s{SINGLE_SEED}.pt"
@@ -747,7 +757,16 @@ def strategy(df, context, model_cache_dir=None, model_retrain_hours=MODEL_RETRAI
                 live_mode = True
                 print(f"  [cache] {asset}: załadowano model z dysku ({model_path.name})")
 
-    # ─── Trening (gdy brak cache lub za stary) ───
+    # ─── Tryb val — użyj modelu z sesji treningowej (fix in-sample bias) ───
+    # evaluate() wywołuje strategy(train_df) przed strategy(val_df).
+    # Gdy train_df już przetworzone, model jest w _SESSION_MODELS.
+    # Val pobiera ten model i predykuje na danych val bez re-treningu.
+    if model_info is None and asset in _SESSION_MODELS and _SESSION_MODELS[asset]:
+        model_info = _SESSION_MODELS[asset][-1][0]
+        session_mode = True
+        print(f"  [session] {asset}: używam modelu z train (unikam re-treningu na val)")
+
+    # ─── Trening (gdy brak cache i brak modelu sesji = tryb train) ───
     if model_info is None:
         fwd_ret = close.pct_change(24).shift(-24)
         te = int(n * 0.80)
@@ -755,7 +774,7 @@ def strategy(df, context, model_cache_dir=None, model_retrain_hours=MODEL_RETRAI
             features.iloc[:te], fwd_ret.iloc[:te],
             lookback=LOOKBACK, n_epochs=300, lr=0.002, seed=SINGLE_SEED
         )
-        # Zapisz do _SESSION_MODELS (potrzebne do save_best_models)
+        # Zapisz do _SESSION_MODELS (potrzebne do save_best_models i trybu val)
         if asset not in _SESSION_MODELS:
             _SESSION_MODELS[asset] = []
         _SESSION_MODELS[asset].append((model_info, SINGLE_SEED))
@@ -765,9 +784,9 @@ def strategy(df, context, model_cache_dir=None, model_retrain_hours=MODEL_RETRAI
             save_model(model_info, Path(model_cache_dir) / f"lstm_{asset}_s{SINGLE_SEED}.pt")
 
     # ─── Predykcja ───
-    # Live mode: na pełnych danych (w tym świeże świece poza oknem treningowym)
-    # Backtest mode: tylko na train_valid_idx (unikamy lookahead)
-    if live_mode:
+    # Live/session: predict_live na pełnym zakresie (valid_idx nie ogranicza zakresu)
+    # Train: predict_lstm_confidence tylko na indeksach treningowych (bez lookahead)
+    if live_mode or session_mode:
         nn_pred = predict_live(model_info, features)
     else:
         nn_pred = predict_lstm_confidence(model_info, features)
