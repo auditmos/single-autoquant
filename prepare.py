@@ -35,6 +35,12 @@ EXCHANGE_OVERRIDES = {
     # TAO/USDT — Binance (od 2024-04), ~11 mies. train + 1 rok val
 }
 
+# Daty startowe per (symbol, exchange) — dla giełd bez pełnej historii od 2017
+# KuCoin XMR/USDT dostępne od 2021-04 (wcześniej brak notowań)
+SINCE_OVERRIDES = {
+    ("XMR/USDT", "kucoin"): "2021-04-01",
+}
+
 # Barometry rynku — ETF intraday (Alpha Vantage)
 BAROMETER_ASSETS = ["SPY", "QQQ", "UUP", "GLD", "VIXY"]
 
@@ -111,7 +117,13 @@ def _fetch_crypto_ohlcv(symbol: str, timeframe: str = "1h",
         since_ts = candles[-1][0] + 1
 
         if len(candles) < limit:
-            break
+            # Koniec danych tylko jeśli ostatnia świeca jest aktualna (< 2h temu).
+            # Niektóre giełdy (KuCoin) zwracają mniej niż limit w środku historii
+            # z powodów API — w takim przypadku kontynuujemy paginację.
+            last_ts_sec = candles[-1][0] / 1000
+            if time.time() - last_ts_sec < 7200:
+                break
+            # Ostatnia świeca jest stara → giełda zwróciła mniej (API quirk), kontynuuj
 
         if len(all_candles) % 10000 < limit:
             dt = pd.Timestamp(candles[-1][0], unit="ms")
@@ -141,7 +153,8 @@ def download_crypto(symbol: str, force: bool = False) -> pd.DataFrame:
         return pd.read_parquet(cache_path)
 
     print(f"  {symbol}: pobieram 1h z {exchange_id}...")
-    df = _fetch_crypto_ohlcv(symbol, INTERVAL_1H)
+    since = SINCE_OVERRIDES.get((symbol, exchange_id), "2017-01-01")
+    df = _fetch_crypto_ohlcv(symbol, INTERVAL_1H, since=since)
 
     if df.empty:
         raise RuntimeError(f"Brak danych dla {symbol}")
