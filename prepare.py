@@ -25,21 +25,12 @@ load_dotenv(Path(__file__).parent / ".env")
 
 # ─── Konfiguracja ───────────────────────────────────────────────
 
-# Aktywa handlowane (krypto, ccxt)
-# Domyślnie Binance, wyjątki w EXCHANGE_OVERRIDES
-CRYPTO_ASSETS = ["BTC/USDT", "ETH/USDT", "XMR/USDT", "SOL/USDT", "TAO/USDT"]
+# Configurable asset list from ASSETS env var
+_env_assets = [a.strip() for a in os.getenv("ASSETS", "BTC,ETH,XMR,SOL,TAO").split(",")]
+CRYPTO_ASSETS = [f"{a}/USDT" for a in _env_assets]
 
-# Giełdy per asset (domyślnie Binance, tu wyjątki)
-EXCHANGE_OVERRIDES = {
-    "XMR/USDT": "kucoin",  # Binance zdelisował XMR; KuCoin ma największy vol XMR/USDT
-    # TAO/USDT — Binance (od 2024-04), ~11 mies. train + 1 rok val
-}
-
-# Daty startowe per (symbol, exchange) — dla giełd bez pełnej historii od 2017
-# KuCoin XMR/USDT dostępne od 2021-04 (wcześniej brak notowań)
-SINCE_OVERRIDES = {
-    ("XMR/USDT", "kucoin"): "2021-04-01",
-}
+EXCHANGE_OVERRIDES = {"XMR/USDT": "kucoin"}
+SINCE_OVERRIDES = {("XMR/USDT", "kucoin"): "2021-04-01"}
 
 # Barometry rynku — ETF intraday (Alpha Vantage)
 BAROMETER_ASSETS = ["SPY", "QQQ", "UUP", "GLD", "VIXY"]
@@ -52,12 +43,13 @@ MACRO_INDICATORS = {
     "TREASURY_2Y": {"function": "TREASURY_YIELD", "maturity": "2year", "interval": "daily"},
 }
 
-# News sentiment (Alpha Vantage)
-SENTIMENT_TICKERS = ["COIN:BTC", "COIN:ETH"]
+# Futures: only assets with Binance Futures
+_KNOWN_FUTURES = {"BTC/USDT", "ETH/USDT", "SOL/USDT"}
+FUTURES_ASSETS = [a for a in CRYPTO_ASSETS if a in _KNOWN_FUTURES]
 
-# Funding rate + Open Interest (Binance Futures)
-# Tylko dla par dostępnych na Binance Futures
-FUTURES_ASSETS = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]  # XMR/TAO brak futures
+# Sentiment: only BTC/ETH have meaningful crypto news on AV
+_KNOWN_SENTIMENT = {"BTC", "ETH"}
+SENTIMENT_TICKERS = [f"CRYPTO:{a}" for a in _env_assets if a in _KNOWN_SENTIMENT]
 
 INTERVAL_1H = "1h"
 CACHE_DIR = Path.home() / ".cache" / "autoquant" / "data"
@@ -358,6 +350,7 @@ def _fetch_av_sentiment(tickers: list[str]) -> pd.DataFrame:
             "tickers": ticker,
             "limit": 1000,
             "sort": "LATEST",
+            "time_from": "20230101T0000",
             "apikey": AV_API_KEY,
         }
         resp = requests.get(AV_BASE_URL, params=params, timeout=30)
@@ -571,7 +564,7 @@ def load_all_data(timeframe: str = "1h") -> tuple[dict[str, pd.DataFrame], dict[
         if not sent_df.empty:
             # Pivot na osobne kolumny per ticker
             for ticker in SENTIMENT_TICKERS:
-                safe_name = f"NEWS_{ticker.replace('COIN:', '')}"
+                safe_name = f"NEWS_{ticker.replace('CRYPTO:', '').replace('COIN:', '')}"
                 ticker_data = sent_df[sent_df["ticker"] == ticker].copy()
                 if not ticker_data.empty:
                     ticker_data = ticker_data.set_index("timestamp")[["sentiment"]]

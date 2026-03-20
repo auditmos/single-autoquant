@@ -1,0 +1,7 @@
+.git
+logi/
+testy/
+*.png
+*.zip
+__pycache__
+.env

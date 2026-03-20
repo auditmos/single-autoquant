@@ -1,17 +1,17 @@
-# Program agenta — Autoquant (Faza 3)
+# Program agenta — Autoquant (Faza 4: Docker + nowe dane)
 
 Jesteś autonomicznym agentem optymalizującym strategie tradingowe na krypto.
 
 ## Twoje zadanie
 
 Modyfikuj `strategy.py` aby maksymalizować metrykę `score` (wyższy = lepiej).
-Po każdej modyfikacji uruchom `python3 strategy.py` i sprawdź wynik.
+Po każdej modyfikacji uruchom `uv run strategy.py` i sprawdź wynik.
 
 ## Zasady
 
 1. Modyfikuj **wyłącznie** `strategy.py` — `prepare.py` jest read-only
-2. Nie dodawaj nowych zależności (pip install). Dostępne: torch, pandas, numpy
-3. Każdy eksperyment: `python3 strategy.py > logi/run_NNN.log 2>&1` (NNN = numer z results.tsv)
+2. Nie dodawaj nowych zależności. Dostępne: torch, pandas, numpy, ccxt, requests
+3. Każdy eksperyment: `uv run strategy.py > logi/run_NNN.log 2>&1` (NNN = numer z results.tsv)
 4. Wyniki zapisują się automatycznie do `results.tsv`
 5. Zmień zmienną `OPIS` w strategy.py na krótki opis co zmieniłeś
 
@@ -20,20 +20,36 @@ Po każdej modyfikacji uruchom `python3 strategy.py` i sprawdź wynik.
 1. Przeczytaj `strategy.py`, `results.tsv` i NINIEJSZY plik (`program.md`)
 2. Wymyśl ulepszenie (NIE powtarzaj tego co jest w sekcji "Nie powtarzać")
 3. Zmodyfikuj `strategy.py` i zmień `OPIS`
-4. Uruchom: `python3 strategy.py`
+4. Uruchom: `uv run strategy.py`
 5. Sprawdź `score:` w outputcie
-6. Jeśli score > aktualny rekord (3.456) → zachowaj, zaktualizuj `program.md`
+6. Jeśli score lepszy → zachowaj, zaktualizuj sekcję "Aktualny rekord" w `program.md`
 7. Jeśli score gorszy → cofnij zmiany, idź do kroku 2
 8. Powtarzaj
 
 ---
 
-## Aktualny rekord — exp #109 (2026-03-19)
+## ⚠️ Zmiana danych vs Faza 3
 
-**Score: 3.4564**
-**Konfiguracja:** `LSTM_h384_3L_drop03_target24h_discrete_funding_1H`
+**results.tsv wyzerowany** — stare wyniki nieporównywalne (inne dane):
 
+| Co | Faza 3 | Faza 4 |
+|----|--------|--------|
+| XMR giełda | Bitfinex | **KuCoin** (inna historia cenowa!) |
+| Sentyment ticker | `COIN:BTC` (zwracał 0 wyników) | **`CRYPTO:BTC`** (naprawiony) |
+| Lista assetów | hardcoded 5 | **z .env ASSETS** |
+
+Pierwszy run ustali nowy baseline. Stare wyniki w `results_v1.tsv`.
+Wiedza architektoniczna (sekcja "Nie powtarzaj") wciąż aktualna — dotyczy modelu, nie danych.
+
+---
+
+## Aktualny rekord
+
+**Brak — pierwszy run ustali baseline.**
+
+Punkt wejścia (najlepsza konfiguracja z Fazy 3, score ~3.46 na starych danych):
 ```
+LSTM_h384_3L_drop03_target24h_discrete_funding_1H
 Model:    LSTM 3-warstwowy (hidden=384) + BatchNorm + dropout=0.3
 Target:   close.pct_change(24).shift(-24)   ← 24h forward return
 Lookback: 168 świec (7 dni na 1H)
@@ -45,18 +61,6 @@ Sygnały:  dyskretne progi: >0.15→0.5, >0.35→0.75, >0.55→1.0
 ATR stop: multiplier=1.9, cooldown=24, profit_target_atr=3.0
 Seed:     SINGLE_SEED=42, okno train=80%
 ```
-
-**Per-asset (exp #109):**
-
-| Asset | Val Sharpe | Val Return | Score |
-|-------|-----------|-----------|-------|
-| BTC   | 3.415 | +74% | 1.79 |
-| ETH   | 5.559 | +368% | 3.79 |
-| XMR   | 7.707 | +1402% | 3.64 |
-| SOL   | 4.147 | +254% | 2.41 |
-| TAO   | 6.976 | +1702% | 5.66 |
-
-BTC jest najsłabszy — val period 2025-03→2026-03 był bessą dla BTC (B&H = -10.80%).
 
 ---
 
@@ -72,7 +76,7 @@ To artefakt bezkosztowego backtestu + compounding. W produkcji: 3000 trades × 0
 
 ---
 
-## 🚫 NIE POWTARZAJ — zbadane i odrzucone
+## 🚫 NIE POWTARZAJ — zbadane i odrzucone (Faza 3, 123 eksperymenty)
 
 ### Architektura modelu
 
@@ -110,7 +114,11 @@ To artefakt bezkosztowego backtestu + compounding. W produkcji: 3000 trades × 0
 
 ---
 
-## ✅ Co warto próbować dalej
+## ✅ Co warto próbować (priorytetyzowane)
+
+### Nowe w Fazie 4 (nigdy nie testowane z poprawnymi danymi)
+- **NEWS sentiment jako feature** — `context['NEWS_BTC']`, `context['NEWS_ETH']` — teraz CRYPTO:BTC zwraca dane (w Fazie 3 zwracał 0)
+- **Spread 10Y-2Y** yield curve — `context['TREASURY_10Y'] - context['TREASURY_2Y']`
 
 ### Architektura (priorytet wysoki)
 - **BiLSTM** — dwukierunkowy LSTM, może lepiej uchwycić długoterminowe zależności
@@ -120,8 +128,6 @@ To artefakt bezkosztowego backtestu + compounding. W produkcji: 3000 trades × 0
 ### Features (priorytet średni)
 - **OBV** (On-Balance Volume) — wolumen-momentum
 - **Stochastic RSI** — bardziej czuły oscylator
-- **Spread 10Y-2Y** yield curve — `context['TREASURY_10Y'] - context['TREASURY_2Y']`
-- **NEWS sentiment** — `context['NEWS_BTC']`, `context['NEWS_ETH']` (daily)
 - **Williams %R** — momentum
 
 ### ATR i zarządzanie pozycją (priorytet średni)
@@ -135,22 +141,7 @@ To artefakt bezkosztowego backtestu + compounding. W produkcji: 3000 trades × 0
 
 ---
 
-## Ewolucja wyników (historia)
-
-```
-Faza 1 (rule-based):   0.408
-MLP (sieć neuronowa):  1.064
-LSTM 2L h=256 lb=168:  1.903  (#93, 2026-03-17)
-LSTM h=384 2L:         1.948  (#101, 2026-03-18)
-LSTM h=384 3L:         2.116  (#103, 2026-03-19 00:18)
-+dropout=0.4:          2.188  (#105, 2026-03-19 01:36)
-+target=24h:           3.341  (#108, 2026-03-19 02:54)
-+dropout=0.3:          3.456  (#109, 2026-03-19 03:29)  ← REKORD
-```
-
----
-
-## Kluczowe odkrycia techniczne
+## Kluczowe odkrycia techniczne (Faza 3)
 
 1. **BatchNorm obowiązkowy** — skok 0.60→0.80, bez niego LSTM nie stabilizuje się
 2. **LSTM >> MLP** na time series krypto (+79%)
@@ -160,6 +151,11 @@ LSTM h=384 3L:         2.116  (#103, 2026-03-19 00:18)
 6. **h=384 sweet spot** — h=256 za mały, h=512 niestabilny dla wieloassetowego modelu
 7. **market_funding** (avg FR_BTC+ETH+SOL) >> per-asset funding (XMR/TAO nie mają własnych futures)
 8. **_strip_tz() konieczny** — funding rate ma UTC timezone, OHLCV nie ma TZ
+
+### Robustność (test z 5 seedami, Faza 3)
+- "Prawdziwy" score seed-agnostyczny: ~1.65 ± 0.26 (CV=15.8%) na starych danych
+- XMR niestabilny między seedami (std=0.98), reszta stabilna
+- Seed 42 był ponadprzeciętnie dobry — nie zakładaj że jest optymalny
 
 ---
 
@@ -172,7 +168,7 @@ LSTM h=384 3L:         2.116  (#103, 2026-03-19 00:18)
 | `SPY`, `QQQ`, `UUP`, `GLD` | ETF 1h | kontekst makro |
 | `FED_RATE`, `CPI` | miesięczny | kontekst makro |
 | `TREASURY_10Y`, `TREASURY_2Y` | dzienny | yield curve |
-| `NEWS_BTC`, `NEWS_ETH` | dzienny | sentyment (dotąd nieużywany w features) |
+| `NEWS_BTC`, `NEWS_ETH` | dzienny | sentyment (**nowe w Fazie 4 — teraz działa!**) |
 
 **Uwaga TZ:** funding rate ma UTC timezone → użyj `_strip_tz()` przed reindex.
 
@@ -186,20 +182,18 @@ LSTM h=384 3L:         2.116  (#103, 2026-03-19 00:18)
 - Wyniki logowane automatycznie do `results.tsv`
 - Wszystkie pliki i komentarze w języku polskim
 - evaluate() wywołuje strategy() **10 razy** (5 assetów × 2 okresy: train i val)
+- Lista assetów konfigurowalna przez `ASSETS` env var (default: BTC,ETH,XMR,SOL,TAO)
 - Logi z eksperymentów w folderze `logi/` (format: `logi/run_NNN.log`)
+- Uruchamiaj: `uv run strategy.py` (nie `python3`)
 
 ## live_signals.py
 
 Generuje sygnały live bez ponownego treningu — ładuje modele z dysku.
 
 ```bash
-python3 live_signals.py              # jednorazowo
-python3 live_signals.py --loop       # pętla co godzinę
-python3 live_signals.py --loop --telegram  # + powiadomienia Telegram
+uv run live_signals.py              # jednorazowo
+uv run live_signals.py --loop       # pętla co godzinę
 ```
 
 Modele cache: `~/.cache/autoquant/best_model/lstm_{asset}_s42.pt` (5 plików ~12MB każdy).
-Po każdym `python3 strategy.py` modele są automatycznie aktualizowane.
-
-**Uwaga `_asset_id()`:** SOL w val period (bessa) ma vol < XMR — identyfikacja po vol+cenie:
-`vol < 0.011 AND median > 155` → xmr | `median > 150` → tao | reszta → sol
+Po każdym `uv run strategy.py` modele są automatycznie aktualizowane.

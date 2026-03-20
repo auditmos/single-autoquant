@@ -88,7 +88,7 @@ Kluczowe skoki:
 
 ## Dane
 
-**Krypto (ccxt/Binance):** BTC/USDT, ETH/USDT, SOL/USDT, TAO/USDT, XMR/USDT (Bitfinex) — interwał 1H
+**Krypto (ccxt/Binance):** BTC/USDT, ETH/USDT, SOL/USDT, TAO/USDT, XMR/USDT (KuCoin) — interwał 1H. Lista konfigurowalna przez `ASSETS` env var.
 
 **Makro (Alpha Vantage):** SPY, QQQ, UUP, GLD, VIXY (1H ETF); FED_RATE, CPI, TREASURY_10Y/2Y; funding rates BTC/ETH/SOL futures (co 8H); sentyment newsów BTC/ETH (daily)
 
@@ -100,45 +100,89 @@ Kluczowe skoki:
 
 ```
 autoquant/
-├── prepare.py      ← pobieranie danych + silnik backtestów + scoring (read-only)
-├── strategy.py     ← strategia tradingowa — tu agent wprowadza zmiany
-├── program.md      ← protokół agenta + historia odkryć
-├── STRATEGIA.md    ← opis strategii w języku naturalnym
-├── progress.py     ← wizualizacja progresu eksperymentów
-├── live_signals.py ← sygnały live (bez ponownego treningu, ładuje modele .pt)
-├── results.tsv     ← log wszystkich eksperymentów
-├── logi/           ← pełne logi każdego uruchomienia (run_NNN.log)
-└── testy/          ← szczegółowe notatki z eksperymentów
+├── Dockerfile          ← nvidia/cuda + uv + Claude CLI
+├── docker-compose.yml  ← GPU, bind-mount, env passthrough
+├── entrypoint.sh       ← tryby: login, agent, live, default
+├── notify.sh           ← generic webhook (NOTIFY_ENDPOINT)
+├── pyproject.toml      ← zależności (uv/pip)
+├── .env.example        ← szablon zmiennych środowiskowych
+├── prepare.py          ← pobieranie danych + silnik backtestów + scoring (read-only)
+├── strategy.py         ← strategia tradingowa — tu agent wprowadza zmiany
+├── program.md          ← protokół agenta + historia odkryć
+├── STRATEGIA.md        ← opis strategii w języku naturalnym
+├── progress.py         ← wizualizacja progresu eksperymentów
+├── live_signals.py     ← sygnały live (bez ponownego treningu, ładuje modele .pt)
+├── test_robustness.py  ← test stabilności na wielu seedach
+├── results.tsv         ← log wszystkich eksperymentów
+├── logi/               ← pełne logi każdego uruchomienia (run_NNN.log)
+└── testy/              ← szczegółowe notatki z eksperymentów
 ```
 
 ---
 
-## Szybki start
+## Szybki start (Docker)
 
 ```bash
-# Wymagania: Python 3.10+, CUDA GPU (testowane na RTX 4090)
-cd autoquant/
-
-# Konfiguracja: skopiuj .env.example i uzupełnij klucz Alpha Vantage
+# Wymagania: Docker, nvidia-container-toolkit, Docker Compose v2
 cp .env.example .env
+# uzupełnij ALPHA_VANTAGE_API_KEY (reszta opcjonalna)
 
-# Pierwsze uruchomienie — pobiera dane (~10 min)
-python3 strategy.py
-
-# Wizualizacja wyników
-python3 progress.py
-
-# Sygnały live (po pierwszym treningu)
-python3 live_signals.py --loop
+docker compose build
+docker compose run autoquant login    # jednorazowa auth Claude
+docker compose run autoquant agent    # pętla autonomiczna
 ```
 
-### Uruchomienie agenta autonomicznego
+### Warianty
 
 ```bash
-claude --dangerously-skip-permissions "Przeczytaj program.md i rozpocznij autonomiczną pętlę optymalizacji."
+# Tylko wybrane assety:
+ASSETS=BTC,ETH docker compose run autoquant agent
 
-# Monitoring w osobnym terminalu
-watch -n 30 python3 progress.py
+# Inna karta GPU:
+GPU_ID=1 docker compose run autoquant agent
+
+# Inny model Claude:
+CLAUDE_MODEL=claude-sonnet-4-5 docker compose run autoquant agent
+
+# Webhook notyfikacje:
+NOTIFY_ENDPOINT=https://my-api.com/hook docker compose run autoquant agent
+
+# Live signals:
+docker compose run autoquant live
+
+# Dowolny skrypt:
+docker compose run autoquant progress.py
+```
+
+### Webhook notyfikacje
+
+`notify.sh` wysyła POST JSON na `NOTIFY_ENDPOINT` (no-op gdy pusty). Auth opcjonalny przez `NOTIFY_BEARER`.
+
+**Payload:**
+```json
+{
+  "event": "agent_start | agent_restart | agent_stuck",
+  "message": "Agent starting (assets: BTC,ETH,XMR,SOL,TAO)",
+  "timestamp": "2026-03-20T12:00:00Z",
+  "container": "single-autoquant"
+}
+```
+
+**Eventy:**
+
+| Event | Kiedy |
+|-------|-------|
+| `agent_start` | Start pętli agenta |
+| `agent_restart` | Koniec iteracji Claude (z exit code) |
+| `agent_stuck` | 5 iteracji bez zmiany w results.tsv |
+
+### Bez Dockera (lokalnie)
+
+```bash
+# Wymagania: Python 3.10+, uv, CUDA GPU
+uv sync
+uv run strategy.py
+uv run live_signals.py --loop
 ```
 
 ---

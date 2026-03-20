@@ -17,7 +17,7 @@ for seed in seeds:
     print(f"  SEED = {seed}")
     print(f"{'─'*70}\n")
     
-    strat.GLOBAL_SEED = seed
+    strat.SINGLE_SEED = seed
     strat.OPIS = f"robustness_seed_{seed}"
     
     results = evaluate(strat.strategy, timeframe="1h")

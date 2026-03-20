@@ -1,0 +1,32 @@
+services:
+  autoquant:
+    build: .
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${GPU_ID:-0}"]
+              capabilities: [gpu]
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=${GPU_ID:-0}
+      - CUDA_VISIBLE_DEVICES=${GPU_ID:-0}
+      - ALPHA_VANTAGE_API_KEY
+      - FRED_API_KEY
+      - BITCOIN_DATA_API_KEY
+      - ASSETS=${ASSETS:-BTC,ETH,XMR,SOL,TAO}
+      - NOTIFY_ENDPOINT=${NOTIFY_ENDPOINT:-}
+      - NOTIFY_BEARER=${NOTIFY_BEARER:-}
+      - CLAUDE_MODEL
+      - CLAUDE_TIMEOUT=${CLAUDE_TIMEOUT:-3600}
+    volumes:
+      - .:/app
+      - autoquant-data:/home/researcher/.cache/autoquant/data
+      - autoquant-claude:/home/researcher/.claude
+    stdin_open: true
+    tty: true
+
+volumes:
+  autoquant-data:
+  autoquant-claude:
