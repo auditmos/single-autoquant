@@ -47,19 +47,19 @@ MACRO_INDICATORS = {
 _KNOWN_FUTURES = {"BTC/USDT", "ETH/USDT", "SOL/USDT"}
 FUTURES_ASSETS = [a for a in CRYPTO_ASSETS if a in _KNOWN_FUTURES]
 
-# Sentiment: only BTC/ETH have meaningful crypto news on AV
-_KNOWN_SENTIMENT = {"BTC", "ETH"}
-SENTIMENT_TICKERS = [f"CRYPTO:{a}" for a in _env_assets if a in _KNOWN_SENTIMENT]
+# Sentiment: configurable via SENTIMENT_ASSETS env, default = all ASSETS
+_sent_assets = [a.strip() for a in os.getenv("SENTIMENT_ASSETS", ",".join(_env_assets)).split(",")]
+SENTIMENT_TICKERS = [f"CRYPTO:{a}" for a in _sent_assets if a]
 
 INTERVAL_1H = "1h"
 CACHE_DIR = Path.home() / ".cache" / "autoquant" / "data"
 
 # Okresy (train / validation)
 # Okresy: 3 lata wstecz od 2026-03-17
-TRAIN_START = "2023-03-17"
-TRAIN_END   = "2025-03-17"
-VAL_START   = "2025-03-17"
-VAL_END     = "2026-03-17"
+TRAIN_START = os.getenv("TRAIN_START", "2023-03-17")
+TRAIN_END   = os.getenv("TRAIN_END",   "2025-03-17")
+VAL_START   = os.getenv("VAL_START",   "2025-03-17")
+VAL_END     = os.getenv("VAL_END",     "2026-03-17")
 
 # Koszty transakcji (spot Binance)
 COMMISSION = 0.001   # 0.1% taker fee
@@ -347,10 +347,10 @@ def _fetch_av_sentiment(tickers: list[str]) -> pd.DataFrame:
         print(f"    Pobieram sentyment dla {ticker}...")
         params = {
             "function": "NEWS_SENTIMENT",
-            "tickers": ticker,
+            "tickers": f"COIN,{ticker}",
             "limit": 1000,
             "sort": "LATEST",
-            "time_from": "20230101T0000",
+            "time_from": TRAIN_START.replace("-", "") + "T0000",
             "apikey": AV_API_KEY,
         }
         resp = requests.get(AV_BASE_URL, params=params, timeout=30)
