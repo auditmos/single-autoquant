@@ -13,6 +13,9 @@ RUN useradd -m -s /bin/bash researcher
 # uv for researcher — pre-create share/uv so named volume inherits researcher ownership
 RUN su - researcher -c 'curl -LsSf https://astral.sh/uv/install.sh | sh && mkdir -p /home/researcher/.local/share/uv'
 
+# Pin Python 3.12 — torch.compile not supported on 3.14+
+RUN su - researcher -c '/home/researcher/.local/bin/uv python install 3.12'
+
 WORKDIR /app
 RUN chown researcher:researcher /app
 
