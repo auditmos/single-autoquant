@@ -15,7 +15,7 @@ from pathlib import Path
 from prepare import evaluate, plot_equity
 
 RESULTS_FILE = Path(__file__).parent / "results.tsv"
-OPIS = "LSTM_h384_3L_drop03_target24h_discrete_funding_1H"
+OPIS = "Transformer_d128_4L_4H_target24h_discrete_funding_1H"
 if not torch.cuda.is_available():
     raise RuntimeError(
         "CUDA niedostepne! Wymagane GPU.\n"
@@ -273,7 +273,7 @@ def build_features(df, context):
     return features
 
 
-# ─── Trening LSTM ─────────────────────────────────────────────────
+# ─── Trening ─────────────────────────────────────────────────────
 
 def make_sequences(X, y, lookback):
     """Tworzy sekwencje (sliding window) z macierzy features i targetów."""
@@ -284,12 +284,11 @@ def make_sequences(X, y, lookback):
     return np.array(seqs, dtype=np.float32), np.array(targets, dtype=np.float32)
 
 
-def train_lstm(features, targets, lookback=LOOKBACK, n_epochs=300, lr=0.002, seed=42):
-    """Trenuje LSTM na sekwencjach features → forward return."""
+def train_model(features, targets, lookback=LOOKBACK, n_epochs=300, lr=0.002, seed=42):
+    """Trenuje Transformer na sekwencjach features → forward return."""
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    # Przygotuj dane — usuń NaN, zrób sekwencje
     valid = features.dropna().index.intersection(targets.dropna().index)
     feat_df = features.loc[valid]
     tgt_series = targets.loc[valid]
@@ -297,25 +296,26 @@ def train_lstm(features, targets, lookback=LOOKBACK, n_epochs=300, lr=0.002, see
     X_raw = feat_df.values.astype(np.float32)
     y_raw = tgt_series.values.astype(np.float32)
 
-    # Normalizacja targetów
     yc = np.clip(y_raw, np.percentile(y_raw, 2), np.percentile(y_raw, 98))
     ym = max(abs(yc.max()), abs(yc.min()), 1e-9)
     yn = np.clip(yc / ym, -1, 1)
 
-    # Sekwencje
     _t0 = _time.time()
     X_seq, y_seq = make_sequences(X_raw, yn, lookback)
     print(f"    [timing] make_sequences: {_time.time()-_t0:.1f}s ({len(X_seq)} samples, shape {X_seq.shape})")
     if len(X_seq) < 100:
-        return None  # za mało danych
+        return None
 
     Xt = torch.tensor(X_seq, device=DEVICE)
     yt = torch.tensor(y_seq, device=DEVICE)
-    print(f"    [timing] tensors on {Xt.device}, VRAM alloc: {torch.cuda.memory_allocated()/1e6:.0f}MB" if DEVICE.type == "cuda" else f"    [timing] tensors on CPU")
+    print(f"    [timing] tensors on {Xt.device}, VRAM alloc: {torch.cuda.memory_allocated()/1e6:.0f}MB")
 
     n_features = X_seq.shape[2]
-    model = SignalLSTM(n_features=n_features, hidden=384, n_layers=3, dropout=0.3).to(DEVICE)
-    model = torch.compile(model)
+    model = SignalTransformer(n_features=n_features, d_model=128, n_heads=4, n_layers=4, dropout=0.3).to(DEVICE)
+    try:
+        model = torch.compile(model)
+    except RuntimeError:
+        pass
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.02)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, n_epochs)
 
@@ -332,7 +332,7 @@ def train_lstm(features, targets, lookback=LOOKBACK, n_epochs=300, lr=0.002, see
             xb, yb = Xs[i:i+bs], ys[i:i+bs]
             pred = model(xb)
             mse = ((pred - yb) ** 2).mean()
-            loss = mse - 0.01 * pred.abs().mean()  # zachęta do silnych sygnałów
+            loss = mse - 0.01 * pred.abs().mean()
             opt.zero_grad(); loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step(); el += mse.item(); nb += 1
@@ -349,7 +349,6 @@ def train_lstm(features, targets, lookback=LOOKBACK, n_epochs=300, lr=0.002, see
     print(f"    [timing] training: {_train_elapsed:.1f}s ({ep+1} epochs, {_train_elapsed/(ep+1):.2f}s/epoch, batch={bs})")
 
     model.eval()
-    # Zwróć model + indeksy valid (do mapowania predykcji)
     return model, valid, lookback
 
 
@@ -694,7 +693,7 @@ def _asset_id(df) -> str:
 
 
 def save_model(model_info, path: Path):
-    """Zapisuje model LSTM do pliku .pt"""
+    """Zapisuje model Transformer do pliku .pt"""
     if model_info is None:
         return
     model, valid_idx, lookback = model_info
@@ -702,24 +701,27 @@ def save_model(model_info, path: Path):
     torch.save({
         "state_dict": model.state_dict(),
         "n_features": raw.input_bn.num_features,
-        "hidden": raw.lstm.hidden_size,
-        "n_layers": raw.lstm.num_layers,
-        "dropout": raw.lstm.dropout,
+        "d_model": raw.input_proj.out_features,
+        "n_heads": raw.encoder.layers[0].self_attn.num_heads,
+        "n_layers": len(raw.encoder.layers),
+        "dropout": raw.encoder.layers[0].dropout.p if hasattr(raw.encoder.layers[0], 'dropout') else 0.3,
         "lookback": lookback,
         "valid_idx": valid_idx,
+        "model_type": "transformer",
     }, path)
 
 
 def load_model(path: Path):
-    """Ładuje model LSTM z pliku .pt — zwraca model_info lub None przy błędzie."""
+    """Ładuje model Transformer z pliku .pt — zwraca model_info lub None przy błędzie."""
     if not path.exists():
         return None
     try:
         data = torch.load(path, map_location=DEVICE, weights_only=False)
-        model = SignalLSTM(
+        model = SignalTransformer(
             n_features=data["n_features"],
-            hidden=data["hidden"],
-            n_layers=data["n_layers"],
+            d_model=data.get("d_model", 128),
+            n_heads=data.get("n_heads", 4),
+            n_layers=data.get("n_layers", 4),
             dropout=data.get("dropout", 0.3),
         ).to(DEVICE)
         model.load_state_dict(data["state_dict"])
@@ -743,21 +745,20 @@ def save_best_models(model_dir: Path = BEST_MODEL_DIR):
     count = 0
     for asset, models in _SESSION_MODELS.items():
         for model_info, seed in models:
-            save_model(model_info, model_dir / f"lstm_{asset}_s{seed}.pt")
+            save_model(model_info, model_dir / f"transformer_{asset}_s{seed}.pt")
             count += 1
     print(f"  🏆 Zapisano {count} modeli → {model_dir}")
 
 
 def strategy(df, context, model_cache_dir=None, model_retrain_hours=MODEL_RETRAIN_HOURS):
     """
-    LSTM 3L h=384 + BatchNorm + dropout=0.3, target=24h forward return.
+    Transformer d128 4L 4H + BatchNorm + dropout=0.3, target=24h forward return.
 
     Tryby działania:
     1. Live (model_cache_dir + świeży plik .pt) → ładuje model z dysku
     2. Val/backtest — evaluate() wywołuje strategy() osobno dla train i val.
        Gdy train był już przetworzony, model jest w _SESSION_MODELS.
-       Val używa tego modelu zamiast trenować od nowa na danych val
-       (poprzednie zachowanie = in-sample bias na zbiorze walidacyjnym).
+       Val używa tego modelu zamiast trenować od nowa na danych val.
     3. Train — brak cache i brak modelu sesji → trening od zera, zapis do _SESSION_MODELS.
     """
     _t_strat = _time.time()
@@ -793,7 +794,7 @@ def strategy(df, context, model_cache_dir=None, model_retrain_hours=MODEL_RETRAI
     if model_info is None:
         fwd_ret = close.pct_change(24).shift(-24)
         te = int(n * 0.80)
-        model_info = train_lstm(
+        model_info = train_model(
             features.iloc[:te], fwd_ret.iloc[:te],
             lookback=LOOKBACK, n_epochs=300, lr=0.002, seed=SINGLE_SEED
         )

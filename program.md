@@ -49,8 +49,8 @@ Wiedza architektoniczna (sekcja "Nie powtarzaj") wciąż aktualna — dotyczy mo
 
 Punkt wejścia (najlepsza konfiguracja z Fazy 3, score ~3.46 na starych danych):
 ```
-LSTM_h384_3L_drop03_target24h_discrete_funding_1H
-Model:    LSTM 3-warstwowy (hidden=384) + BatchNorm + dropout=0.3
+Transformer_d128_4L_4H_target24h_discrete_funding_1H
+Model:    Transformer encoder 4-warstwowy (d_model=128, 4 heads) + BatchNorm + dropout=0.3
 Target:   close.pct_change(24).shift(-24)   ← 24h forward return
 Lookback: 168 świec (7 dni na 1H)
 Trening:  300 epok, lr=0.002, AdamW wd=0.02, CosineAnnealingLR, batch=512
@@ -121,9 +121,9 @@ To artefakt bezkosztowego backtestu + compounding. W produkcji: 3000 trades × 0
 - **Spread 10Y-2Y** yield curve — `context['TREASURY_10Y'] - context['TREASURY_2Y']`
 
 ### Architektura (priorytet wysoki)
-- **BiLSTM** — dwukierunkowy LSTM, może lepiej uchwycić długoterminowe zależności
-- **GRU** zamiast LSTM — mniej parametrów, często porównywalny wynik
-- **h=256 3L** — mniejszy model, bardziej regularny niż h=384
+- **Transformer tuning** — d_model, n_heads, n_layers, feedforward dim
+- **Conv1D + Transformer hybrid** — lokalne wzorce + globalna uwaga
+- **Mniejszy Transformer** — d_model=64, 2L — bardziej regularny
 
 ### Features (priorytet średni)
 - **OBV** (On-Balance Volume) — wolumen-momentum
@@ -143,12 +143,12 @@ To artefakt bezkosztowego backtestu + compounding. W produkcji: 3000 trades × 0
 
 ## Kluczowe odkrycia techniczne (Faza 3)
 
-1. **BatchNorm obowiązkowy** — skok 0.60→0.80, bez niego LSTM nie stabilizuje się
-2. **LSTM >> MLP** na time series krypto (+79%)
+1. **BatchNorm obowiązkowy** — skok 0.60→0.80, bez niego model nie stabilizuje się
+2. **Sequence models >> MLP** na time series krypto (+79%)
 3. **1H >> 4H** — 4× więcej danych treningowych, lepszy signal-to-noise
 4. **predict_lstm_confidence() >> predict_on_data()** — OOS predykcje są noisy
 5. **Interakcja dropout×target**: krótszy target → mniej regularizacji potrzeba
-6. **h=384 sweet spot** — h=256 za mały, h=512 niestabilny dla wieloassetowego modelu
+6. **Transformer zamiast LSTM** — cuDNN LSTM kernele niezoptymalizowane na Blackwell (RTX 5070), Transformer 4-10x szybszy
 7. **market_funding** (avg FR_BTC+ETH+SOL) >> per-asset funding (XMR/TAO nie mają własnych futures)
 8. **_strip_tz() konieczny** — funding rate ma UTC timezone, OHLCV nie ma TZ
 
@@ -195,5 +195,5 @@ uv run live_signals.py              # jednorazowo
 uv run live_signals.py --loop       # pętla co godzinę
 ```
 
-Modele cache: `~/.cache/autoquant/best_model/lstm_{asset}_s42.pt` (5 plików ~12MB każdy).
+Modele cache: `~/.cache/autoquant/best_model/transformer_{asset}_s42.pt` (5 plików).
 Po każdym `uv run strategy.py` modele są automatycznie aktualizowane.
