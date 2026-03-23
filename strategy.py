@@ -312,10 +312,7 @@ def train_model(features, targets, lookback=LOOKBACK, n_epochs=300, lr=0.002, se
 
     n_features = X_seq.shape[2]
     model = SignalTransformer(n_features=n_features, d_model=128, n_heads=4, n_layers=4, dropout=0.3).to(DEVICE)
-    try:
-        model = torch.compile(model)
-    except RuntimeError:
-        pass
+    # torch.compile disabled — inductor "Not enough SMs" on RTX 5070, adds overhead without benefit
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.02)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, n_epochs)
 
@@ -840,7 +837,7 @@ def strategy(df, context, model_cache_dir=None, model_retrain_hours=MODEL_RETRAI
 
 if __name__ == "__main__":
     print("=" * 60)
-    print(f"AUTOQUANT — LSTM Hybrid (PyTorch na {DEVICE})")
+    print(f"AUTOQUANT — Transformer (PyTorch na {DEVICE})")
     print(f"  Lookback: {LOOKBACK} świec, Timeframe: 1H")
     print(f"  CUDA available: {torch.cuda.is_available()}")
     print(f"  CUDA built: {torch.backends.cuda.is_built()}")
