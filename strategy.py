@@ -316,7 +316,10 @@ def train_lstm(features, targets, lookback=LOOKBACK, n_epochs=300, lr=0.002, see
 
     n_features = X_seq.shape[2]
     model = SignalLSTM(n_features=n_features, hidden=384, n_layers=3, dropout=0.3).to(DEVICE)
-    model = torch.compile(model)
+    try:
+        model = torch.compile(model)
+    except RuntimeError:
+        pass
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.02)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, n_epochs)
 
