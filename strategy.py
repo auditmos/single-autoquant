@@ -5,6 +5,7 @@ GPU RTX 4090 wykorzystane do treningu i inferencji.
 Agent modyfikuje TEN plik. prepare.py jest read-only.
 """
 
+import time as _time
 import pandas as pd
 import numpy as np
 import torch
@@ -16,7 +17,13 @@ from prepare import evaluate, plot_equity
 
 RESULTS_FILE = Path(__file__).parent / "results.tsv"
 OPIS = "LSTM_h384_3L_drop03_target24h_discrete_funding_1H"
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if not torch.cuda.is_available():
+    raise RuntimeError(
+        "CUDA niedostepne! Wymagane GPU.\n"
+        "Sprawdz: nvidia-smi, nvidia-container-toolkit, torch CUDA build.\n"
+        f"torch.backends.cuda.is_built()={torch.backends.cuda.is_built()}"
+    )
+DEVICE = torch.device("cuda")
 LOOKBACK = 168  # 168 świec lookback (7 dni na 1H)
 SINGLE_SEED = 42  # jednolity seed dla wszystkich assetów (bez per-asset ensemble)
 
@@ -295,12 +302,15 @@ def train_lstm(features, targets, lookback=LOOKBACK, n_epochs=300, lr=0.002, see
     yn = np.clip(yc / ym, -1, 1)
 
     # Sekwencje
+    _t0 = _time.time()
     X_seq, y_seq = make_sequences(X_raw, yn, lookback)
+    print(f"    [timing] make_sequences: {_time.time()-_t0:.1f}s ({len(X_seq)} samples, shape {X_seq.shape})")
     if len(X_seq) < 100:
         return None  # za mało danych
 
     Xt = torch.tensor(X_seq, device=DEVICE)
     yt = torch.tensor(y_seq, device=DEVICE)
+    print(f"    [timing] tensors on {Xt.device}, VRAM alloc: {torch.cuda.memory_allocated()/1e6:.0f}MB" if DEVICE.type == "cuda" else f"    [timing] tensors on CPU")
 
     n_features = X_seq.shape[2]
     model = SignalLSTM(n_features=n_features, hidden=384, n_layers=3, dropout=0.3).to(DEVICE)
@@ -310,6 +320,7 @@ def train_lstm(features, targets, lookback=LOOKBACK, n_epochs=300, lr=0.002, see
     bs = min(512, len(Xt))
     best_loss, patience, no_imp = float("inf"), 25, 0
 
+    _t_train = _time.time()
     model.train()
     for ep in range(n_epochs):
         perm = torch.randperm(len(Xt), device=DEVICE)
@@ -328,6 +339,12 @@ def train_lstm(features, targets, lookback=LOOKBACK, n_epochs=300, lr=0.002, see
         if al < best_loss - 1e-6: best_loss, no_imp = al, 0
         else: no_imp += 1
         if no_imp >= patience: break
+
+    if DEVICE.type == "cuda":
+        torch.cuda.synchronize()
+    _t_train_end = _time.time()
+    _train_elapsed = _t_train_end - _t_train
+    print(f"    [timing] training: {_train_elapsed:.1f}s ({ep+1} epochs, {_train_elapsed/(ep+1):.2f}s/epoch, batch={bs})")
 
     model.eval()
     # Zwróć model + indeksy valid (do mapowania predykcji)
@@ -740,8 +757,11 @@ def strategy(df, context, model_cache_dir=None, model_retrain_hours=MODEL_RETRAI
        (poprzednie zachowanie = in-sample bias na zbiorze walidacyjnym).
     3. Train — brak cache i brak modelu sesji → trening od zera, zapis do _SESSION_MODELS.
     """
+    _t_strat = _time.time()
     close = df["close"]
+    _t0 = _time.time()
     features = build_features(df, context)
+    _t_feat = _time.time() - _t0
     n = len(df)
     asset = _asset_id(df)
     live_mode = False
@@ -786,10 +806,12 @@ def strategy(df, context, model_cache_dir=None, model_retrain_hours=MODEL_RETRAI
     # ─── Predykcja ───
     # Live/session: predict_live na pełnym zakresie (valid_idx nie ogranicza zakresu)
     # Train: predict_lstm_confidence tylko na indeksach treningowych (bez lookahead)
+    _t0 = _time.time()
     if live_mode or session_mode:
         nn_pred = predict_live(model_info, features)
     else:
         nn_pred = predict_lstm_confidence(model_info, features)
+    _t_pred = _time.time() - _t0
 
     # ─── Dyskretne progi (jak w rekordowym #93) ───
     # Ciągłe pozycjonowanie (#95) tworzyło 3949 trades vs 785 w #93 → ogromne koszty
@@ -800,9 +822,13 @@ def strategy(df, context, model_cache_dir=None, model_retrain_hours=MODEL_RETRAI
     signals[nn_pred < -0.15] = -0.5
     signals[nn_pred < -0.55] = -1.0
 
+    _t0 = _time.time()
     atr_val = atr(df, period=14)
     signals = atr_trailing_stop(close, atr_val, signals,
                                 multiplier=1.9, cooldown=24, profit_target_atr=3.0)
+    _t_atr = _time.time() - _t0
+    _mode = "live" if live_mode else ("session/val" if session_mode else "train")
+    print(f"  [timing] {asset} ({_mode}): features={_t_feat:.1f}s predict={_t_pred:.1f}s atr={_t_atr:.1f}s total={_time.time()-_t_strat:.1f}s")
     return signals
 
 
@@ -812,12 +838,23 @@ if __name__ == "__main__":
     print("=" * 60)
     print(f"AUTOQUANT — LSTM Hybrid (PyTorch na {DEVICE})")
     print(f"  Lookback: {LOOKBACK} świec, Timeframe: 1H")
+    print(f"  CUDA available: {torch.cuda.is_available()}")
+    print(f"  CUDA built: {torch.backends.cuda.is_built()}")
+    print(f"  GPU: {torch.cuda.get_device_name(0)}")
+    print(f"  VRAM: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB")
+    print(f"  cuDNN: {torch.backends.cudnn.version()}")
     print("=" * 60 + "\n")
 
+    _t_total = _time.time()
     results = evaluate(strategy, timeframe="1h")
     avg_score = results["_avg_score"]
 
-    print(f"\n{'='*60}\nWYNIK KOŃCOWY (avg score): {avg_score}\n{'='*60}")
+    print(f"\n{'='*60}")
+    print(f"WYNIK KOŃCOWY (avg score): {avg_score}")
+    print(f"TOTAL TIME: {_time.time()-_t_total:.1f}s")
+    if torch.cuda.is_available():
+        print(f"GPU peak VRAM: {torch.cuda.max_memory_allocated()/1e6:.0f}MB")
+    print(f"{'='*60}")
     plot_equity(results)
 
     assets = [k for k in results if not k.startswith("_")]

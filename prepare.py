@@ -512,31 +512,41 @@ def load_all_data(timeframe: str = "1h") -> tuple[dict[str, pd.DataFrame], dict[
           - Makro (resampled do daily): FED_RATE, CPI, TREASURY_10Y, TREASURY_2Y
           - Sentyment: NEWS_BTC, NEWS_ETH (daily sentiment scores)
     """
+    _t_load_all = time.time()
     print(f"Ładowanie danych ({timeframe})...")
 
     crypto_data = {}
+    _t0 = time.time()
     for symbol in CRYPTO_ASSETS:
         try:
+            _ts = time.time()
             df = download_crypto(symbol)
             if timeframe == "4h":
                 df = resample_to_4h(df)
             crypto_data[symbol] = df
+            print(f"  [timing] {symbol}: {time.time()-_ts:.1f}s ({len(df)} rows)")
         except Exception as e:
             print(f"  ⚠ {symbol}: błąd pobierania — {e}")
+    print(f"  [timing] krypto total: {time.time()-_t0:.1f}s")
 
     barometer_data = {}
 
     # ETF barometry (intraday)
+    _t0 = time.time()
     for symbol in BAROMETER_ASSETS:
         try:
+            _ts = time.time()
             df = download_barometer(symbol)
             if timeframe == "4h":
                 df = resample_to_4h(df)
             barometer_data[symbol] = df
+            print(f"  [timing] {symbol}: {time.time()-_ts:.1f}s ({len(df)} rows)")
         except Exception as e:
             print(f"  ⚠ {symbol}: błąd pobierania — {e}")
+    print(f"  [timing] barometry total: {time.time()-_t0:.1f}s")
 
     # Dane makroekonomiczne (monthly/daily → forward-fill do 4H/1H)
+    _t0 = time.time()
     for name, config in MACRO_INDICATORS.items():
         try:
             df = download_macro(name, config)
@@ -545,8 +555,10 @@ def load_all_data(timeframe: str = "1h") -> tuple[dict[str, pd.DataFrame], dict[
             barometer_data[name] = macro_df
         except Exception as e:
             print(f"  ⚠ {name}: błąd pobierania — {e}")
+    print(f"  [timing] makro total: {time.time()-_t0:.1f}s")
 
     # Funding Rate (Binance Futures)
+    _t0 = time.time()
     for symbol in FUTURES_ASSETS:
         try:
             fr_df = download_funding_rate(symbol)
@@ -557,8 +569,10 @@ def load_all_data(timeframe: str = "1h") -> tuple[dict[str, pd.DataFrame], dict[
                 barometer_data[f"FR_{safe}"] = fr_baro
         except Exception as e:
             print(f"  ⚠ Funding {symbol}: {e}")
+    print(f"  [timing] funding total: {time.time()-_t0:.1f}s")
 
     # News sentiment
+    _t0 = time.time()
     try:
         sent_df = download_sentiment()
         if not sent_df.empty:
@@ -572,13 +586,15 @@ def load_all_data(timeframe: str = "1h") -> tuple[dict[str, pd.DataFrame], dict[
                     barometer_data[safe_name] = ticker_data
     except Exception as e:
         print(f"  ⚠ Sentyment: błąd — {e}")
+    print(f"  [timing] sentiment total: {time.time()-_t0:.1f}s")
 
     n_etf = sum(1 for k in barometer_data if k in BAROMETER_ASSETS)
     n_macro = sum(1 for k in barometer_data if k in MACRO_INDICATORS)
     n_futures = sum(1 for k in barometer_data if k.startswith("FR_"))
     n_sent = sum(1 for k in barometer_data if k.startswith("NEWS_"))
     print(f"\nZaładowano: {len(crypto_data)} krypto, {n_etf} ETF, "
-          f"{n_macro} makro, {n_futures} futures (FR+OI), {n_sent} sentyment\n")
+          f"{n_macro} makro, {n_futures} futures (FR+OI), {n_sent} sentyment")
+    print(f"  [timing] load_all_data TOTAL: {time.time()-_t_load_all:.1f}s\n")
     return crypto_data, barometer_data
 
 
@@ -749,6 +765,7 @@ def evaluate(strategy_fn, timeframe: str = "1h") -> dict:
     scores = []
 
     for symbol, df in crypto_data.items():
+        _t_asset = time.time()
         train_df, val_df = split_periods(df)
 
         if len(train_df) < 100 or len(val_df) < 100:
@@ -765,12 +782,18 @@ def evaluate(strategy_fn, timeframe: str = "1h") -> dict:
             val_context[baro_name] = baro_val
 
         # Generuj sygnały — strategia dostaje dane krypto + kontekst makro
+        _t0 = time.time()
         train_signals = strategy_fn(train_df, train_context)
+        _t_train_strat = time.time() - _t0
+        _t0 = time.time()
         val_signals = strategy_fn(val_df, val_context)
+        _t_val_strat = time.time() - _t0
 
         # Backtest
+        _t0 = time.time()
         train_metrics = backtest(train_df, train_signals)
         val_metrics = backtest(val_df, val_signals)
+        _t_bt = time.time() - _t0
 
         # Score
         score = compute_score(train_metrics, val_metrics)
@@ -800,6 +823,7 @@ def evaluate(strategy_fn, timeframe: str = "1h") -> dict:
         print(f"    B&H:  Train {train_metrics['buy_hold_return']:>8.2%}  "
               f"Val {val_metrics['buy_hold_return']:>8.2%}")
         print(f"    Score: {score}")
+        print(f"    [timing] strategy(train)={_t_train_strat:.1f}s strategy(val)={_t_val_strat:.1f}s backtest={_t_bt:.1f}s asset_total={time.time()-_t_asset:.1f}s")
         print()
 
     avg_score = round(np.mean(scores), 4) if scores else 0.0
