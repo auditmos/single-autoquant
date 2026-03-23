@@ -312,7 +312,10 @@ def train_model(features, targets, lookback=LOOKBACK, n_epochs=300, lr=0.002, se
 
     n_features = X_seq.shape[2]
     model = SignalTransformer(n_features=n_features, d_model=128, n_heads=4, n_layers=4, dropout=0.3).to(DEVICE)
-    # torch.compile disabled — inductor "Not enough SMs" on RTX 5070, adds overhead without benefit
+    try:
+        model = torch.compile(model)
+    except RuntimeError:
+        pass
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.02)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, n_epochs)
 
