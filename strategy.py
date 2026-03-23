@@ -24,6 +24,8 @@ if not torch.cuda.is_available():
         f"torch.backends.cuda.is_built()={torch.backends.cuda.is_built()}"
     )
 DEVICE = torch.device("cuda")
+torch.backends.cudnn.benchmark = True
+torch.set_float32_matmul_precision("high")
 LOOKBACK = 168  # 168 świec lookback (7 dni na 1H)
 SINGLE_SEED = 42  # jednolity seed dla wszystkich assetów (bez per-asset ensemble)
 
@@ -314,6 +316,7 @@ def train_lstm(features, targets, lookback=LOOKBACK, n_epochs=300, lr=0.002, see
 
     n_features = X_seq.shape[2]
     model = SignalLSTM(n_features=n_features, hidden=384, n_layers=3, dropout=0.3).to(DEVICE)
+    model = torch.compile(model)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.02)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, n_epochs)
 
@@ -696,12 +699,13 @@ def save_model(model_info, path: Path):
     if model_info is None:
         return
     model, valid_idx, lookback = model_info
+    raw = getattr(model, "_orig_mod", model)
     torch.save({
         "state_dict": model.state_dict(),
-        "n_features": model.input_bn.num_features,
-        "hidden": model.lstm.hidden_size,
-        "n_layers": model.lstm.num_layers,
-        "dropout": model.lstm.dropout,
+        "n_features": raw.input_bn.num_features,
+        "hidden": raw.lstm.hidden_size,
+        "n_layers": raw.lstm.num_layers,
+        "dropout": raw.lstm.dropout,
         "lookback": lookback,
         "valid_idx": valid_idx,
     }, path)
