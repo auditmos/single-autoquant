@@ -459,6 +459,8 @@ def _fetch_funding_rate(symbol: str, since: str = "2020-01-01") -> pd.DataFrame:
 
     df = pd.DataFrame(all_rates)
     df = df.set_index("timestamp")
+    if df.index.tz is not None:
+        df.index = df.index.tz_localize(None)
     df = df[~df.index.duplicated(keep="first")]
     df = df.sort_index()
     return df
@@ -471,8 +473,15 @@ def download_funding_rate(symbol: str, force: bool = False) -> pd.DataFrame:
     fr_path = CACHE_DIR / f"{safe_name}_funding_rate.parquet"
 
     if fr_path.exists() and not force:
-        print(f"  {symbol} FR: wczytano z cache")
-        return pd.read_parquet(fr_path)
+        try:
+            df = pd.read_parquet(fr_path)
+            if df.index.tz is not None:
+                df.index = df.index.tz_localize(None)
+            print(f"  {symbol} FR: wczytano z cache")
+            return df
+        except Exception:
+            print(f"  {symbol} FR: uszkodzony cache, pobieram ponownie...")
+            fr_path.unlink()
 
     fr_df = _fetch_funding_rate(symbol)
     if not fr_df.empty:
