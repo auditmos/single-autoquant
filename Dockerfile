@@ -18,9 +18,15 @@ RUN su - researcher -c '/home/researcher/.local/bin/uv python install 3.12'
 
 WORKDIR /app
 RUN chown researcher:researcher /app
+RUN mkdir -p /opt/venv && chown researcher:researcher /opt/venv
 
 USER researcher
 ENV PATH="/home/researcher/.local/bin:$PATH"
+
+# Pre-install deps into /opt/venv (survives bind-mount of /app)
+ENV UV_PROJECT_ENVIRONMENT=/opt/venv
+COPY --chown=researcher:researcher pyproject.toml uv.lock* ./
+RUN uv sync --python 3.12 --no-dev --link-mode=copy || uv sync --python 3.12 --no-dev
 
 # Support files
 COPY --chown=researcher:researcher notify.sh ./

@@ -4,4 +4,5 @@ testy/
 *.png
 *.zip
 __pycache__
+.venv
 .env

@@ -16,6 +16,7 @@ fi
 # Everything below runs as researcher
 CACHE_DIR="/home/researcher/.cache/autoquant"
 DATA_DIR="$CACHE_DIR/data"
+export UV_PROJECT_ENVIRONMENT=/opt/venv
 
 notify() { ./notify.sh "$@"; }
 
